@@ -25,6 +25,9 @@ env/
 # data/raw/*
 # data/processed/*
 
+# PVDAQ per-system JSON cache (1800+ small files; auto-rebuilt by fetch_pvdaq.py)
+data/raw/pvdaq_system_jsons/
+
 # Model checkpoints
 models/*.pt
 models/*.pth
