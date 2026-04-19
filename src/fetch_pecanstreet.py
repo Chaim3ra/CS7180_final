@@ -1,159 +1,170 @@
 """
 fetch_pecanstreet.py
 --------------------
-Authenticate with the Pecan Street Dataport API, pull a small sample of
-residential solar generation data (a few homes, a few days), and save to
-data/raw/pecanstreet_sample.csv.
+Connect to the Pecan Street Dataport PostgreSQL database, pull a small sample
+of residential solar generation data (a few Austin homes, a few days in 2022),
+and save to data/raw/pecanstreet_sample.csv.
+
+Pecan Street Dataport is a direct PostgreSQL database, NOT a REST API.
+Connection parameters (host, port, database name) are shown on
+https://dataport.pecanstreet.org/access after logging in.
 
 Usage:
     python src/fetch_pecanstreet.py
 
-Requires:
-    PECAN_STREET_USERNAME and PECAN_STREET_PASSWORD set in .env
-    (request access at https://dataport.pecanstreet.org)
+Requires in .env:
+    PECAN_STREET_USERNAME    — your Dataport email address
+    PECAN_STREET_PASSWORD    — your Dataport password
+    PECAN_STREET_DB_HOST     — hostname from dataport.pecanstreet.org/access
+    PECAN_STREET_DB_PORT     — port from dataport.pecanstreet.org/access
+    PECAN_STREET_DB_NAME     — database name from dataport.pecanstreet.org/access
 
-Pecan Street Dataport uses a PostgreSQL-over-HTTP interface (PostgREST).
-Authentication is done via a POST to /api/token which returns a JWT that must
-be included as a Bearer token in subsequent requests.
+Install:  pip install psycopg2-binary python-dotenv pandas
 """
 
 import os
 import sys
 
-import requests
 import pandas as pd
 from dotenv import load_dotenv
+
+try:
+    import psycopg2
+    import psycopg2.extras
+except ImportError:
+    sys.exit(
+        "ERROR: psycopg2 is not installed.\n"
+        "  Run:  pip install psycopg2-binary"
+    )
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-load_dotenv()
+load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), "..", ".env"))
 
 USERNAME = os.getenv("PECAN_STREET_USERNAME")
 PASSWORD = os.getenv("PECAN_STREET_PASSWORD")
+DB_HOST  = os.getenv("PECAN_STREET_DB_HOST")
+DB_PORT  = os.getenv("PECAN_STREET_DB_PORT", "5432")
+DB_NAME  = os.getenv("PECAN_STREET_DB_NAME")
 
+_MISSING = []
 if not USERNAME or USERNAME == "your_username_here":
-    sys.exit(
-        "ERROR: PECAN_STREET_USERNAME is not set. Add your credentials to .env\n"
-        "       Request access at https://dataport.pecanstreet.org"
-    )
+    _MISSING.append("PECAN_STREET_USERNAME")
 if not PASSWORD or PASSWORD == "your_password_here":
+    _MISSING.append("PECAN_STREET_PASSWORD")
+if not DB_HOST or DB_HOST == "your_db_host_here":
+    _MISSING.append("PECAN_STREET_DB_HOST  (from dataport.pecanstreet.org/access)")
+if not DB_NAME or DB_NAME == "your_db_name_here":
+    _MISSING.append("PECAN_STREET_DB_NAME  (from dataport.pecanstreet.org/access)")
+if _MISSING:
     sys.exit(
-        "ERROR: PECAN_STREET_PASSWORD is not set. Add your credentials to .env\n"
-        "       Request access at https://dataport.pecanstreet.org"
+        "ERROR: The following .env variables are missing or still set to placeholders:\n"
+        + "\n".join(f"  - {v}" for v in _MISSING)
+        + "\n\nVisit https://dataport.pecanstreet.org/access (after logging in) "
+          "to find the PostgreSQL host, port, and database name."
     )
 
-BASE_URL = "https://dataport.pecanstreet.org"
-AUTH_ENDPOINT = f"{BASE_URL}/api/token"
-DATA_ENDPOINT = f"{BASE_URL}/api/pge_egauge_minutes"   # 1-min interval table
-
-# Sample window: a few homes, a few days
-SAMPLE_HOMES = 5      # number of distinct dataid values to pull
-SAMPLE_DAYS = 3       # number of days
+# Sample window
 START_DATE = "2022-06-01"
-END_DATE = "2022-06-03"
+END_DATE   = "2022-06-03"   # exclusive upper bound
+MAX_HOMES  = 5
 
-OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
+OUT_DIR  = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
 OUT_PATH = os.path.join(OUT_DIR, "pecanstreet_sample.csv")
 
 # ---------------------------------------------------------------------------
-# Auth
+# Database helpers
 # ---------------------------------------------------------------------------
 
-def get_token() -> str:
-    """POST credentials and return the JWT access token."""
-    print("Authenticating with Pecan Street Dataport ...")
+def get_connection() -> "psycopg2.connection":
+    """Open and return a psycopg2 connection to the Dataport PostgreSQL DB."""
+    print(f"Connecting to Dataport PostgreSQL at {DB_HOST}:{DB_PORT}/{DB_NAME} ...")
     try:
-        resp = requests.post(
-            AUTH_ENDPOINT,
-            json={"username": USERNAME, "password": PASSWORD},
-            timeout=30,
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=int(DB_PORT),
+            dbname=DB_NAME,
+            user=USERNAME,
+            password=PASSWORD,
+            connect_timeout=15,
+            sslmode="require",
         )
-    except requests.exceptions.ConnectionError as exc:
-        sys.exit(f"ERROR: Could not reach {AUTH_ENDPOINT}\n  {exc}")
+        print("Connected successfully.")
+        return conn
+    except psycopg2.OperationalError as exc:
+        msg = str(exc).lower()
+        if "password authentication" in msg or "authentication failed" in msg:
+            sys.exit(
+                "ERROR: Authentication failed. "
+                "Check PECAN_STREET_USERNAME and PECAN_STREET_PASSWORD in .env."
+            )
+        if "could not connect" in msg or "connection refused" in msg or "timeout" in msg:
+            sys.exit(
+                f"ERROR: Could not reach {DB_HOST}:{DB_PORT}. "
+                "Check PECAN_STREET_DB_HOST and PECAN_STREET_DB_PORT in .env."
+            )
+        sys.exit(f"ERROR: Database connection failed:\n  {exc}")
 
-    if resp.status_code == 401:
+
+def fetch_sample(conn) -> pd.DataFrame:
+    """
+    Pull 15-minute solar generation data from electricity.eg_realpower_15min.
+
+    Schema (from official Pecan Street DataPort examples):
+        electricity.eg_realpower_15min
+            dataid      INT   — unique home identifier
+            local_15min TIMESTAMP — local timestamp (15-min intervals)
+            solar       FLOAT — solar generation in kWh per 15-min interval
+
+        other_datasets.metadata
+            dataid, city, solar (not null = has solar panels), data availability
+    """
+    print(f"Finding up to {MAX_HOMES} Austin homes with solar data ...")
+
+    # Step 1: pick home IDs with solar panels and data in our window
+    id_query = """
+        SELECT dataid
+        FROM other_datasets.metadata
+        WHERE city = 'Austin'
+          AND solar IS NOT NULL
+          AND egauge_1min_min_time < %(start)s
+          AND egauge_1min_max_time >= %(end)s
+        LIMIT %(limit)s;
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(id_query, {"start": START_DATE, "end": END_DATE, "limit": MAX_HOMES})
+        rows = cur.fetchall()
+
+    if not rows:
         sys.exit(
-            "ERROR: Authentication failed (HTTP 401). "
-            "Check PECAN_STREET_USERNAME and PECAN_STREET_PASSWORD in .env."
-        )
-    if resp.status_code == 403:
-        sys.exit(
-            "ERROR: Access denied (HTTP 403). "
-            "Your account may not have Dataport access yet — "
-            "visit https://dataport.pecanstreet.org to request it."
-        )
-    if resp.status_code != 200:
-        sys.exit(
-            f"ERROR: Unexpected response from auth endpoint "
-            f"(HTTP {resp.status_code})\n{resp.text[:500]}"
-        )
-
-    token = resp.json().get("token") or resp.json().get("access_token")
-    if not token:
-        sys.exit(f"ERROR: No token found in auth response: {resp.json()}")
-
-    print("Authentication successful.")
-    return token
-
-
-# ---------------------------------------------------------------------------
-# Data fetch
-# ---------------------------------------------------------------------------
-
-def fetch_sample(token: str) -> pd.DataFrame:
-    """Pull a small slice of solar generation data using the bearer token."""
-    headers = {"Authorization": f"Bearer {token}"}
-
-    # Step 1: discover a few valid dataids that have solar (solar column > 0)
-    print(f"Fetching up to {SAMPLE_HOMES} home IDs with solar data ...")
-    id_resp = requests.get(
-        DATA_ENDPOINT,
-        headers=headers,
-        params={
-            "select": "dataid",
-            "solar": "gt.0",
-            "localminute": f"gte.{START_DATE}T00:00:00",
-            "limit": 500,
-        },
-        timeout=60,
-    )
-    if id_resp.status_code != 200:
-        sys.exit(
-            f"ERROR: Data query failed (HTTP {id_resp.status_code})\n{id_resp.text[:500]}"
-        )
-
-    ids = list({row["dataid"] for row in id_resp.json()})[:SAMPLE_HOMES]
-    if not ids:
-        sys.exit(
-            "ERROR: No homes with solar data found in the queried range. "
+            "ERROR: No Austin homes with solar data found in the queried window. "
             "Try adjusting START_DATE / END_DATE."
         )
-    print(f"  Found homes: {ids}")
 
-    # Step 2: pull minute-level solar generation for those homes
-    print(f"Fetching minute-level solar data for {START_DATE} to {END_DATE} ...")
-    data_resp = requests.get(
-        DATA_ENDPOINT,
-        headers=headers,
-        params={
-            "select": "dataid,localminute,solar",
-            "dataid": f"in.({','.join(str(i) for i in ids)})",
-            "localminute": f"gte.{START_DATE}T00:00:00",
-            "localminute": f"lte.{END_DATE}T23:59:59",
-            "order": "dataid,localminute",
-            "limit": 50000,
-        },
-        timeout=120,
-    )
-    if data_resp.status_code != 200:
-        sys.exit(
-            f"ERROR: Data query failed (HTTP {data_resp.status_code})\n{data_resp.text[:500]}"
-        )
+    dataids = [r["dataid"] for r in rows]
+    print(f"  Home IDs: {dataids}")
 
-    records = data_resp.json()
+    # Step 2: pull the 15-minute solar generation for those homes
+    print(f"Fetching 15-min solar data for {START_DATE} → {END_DATE} ...")
+    data_query = """
+        SELECT dataid, local_15min, solar
+        FROM electricity.eg_realpower_15min
+        WHERE dataid = ANY(%(ids)s)
+          AND local_15min >= %(start)s
+          AND local_15min  < %(end)s
+        ORDER BY dataid, local_15min;
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(data_query, {
+            "ids":   dataids,
+            "start": START_DATE,
+            "end":   END_DATE,
+        })
+        records = cur.fetchall()
+
     if not records:
-        sys.exit("ERROR: API returned 0 rows. Check the date range and column names.")
+        sys.exit("ERROR: Query returned 0 rows. Check date range or column names.")
 
     return pd.DataFrame(records)
 
@@ -163,8 +174,11 @@ def fetch_sample(token: str) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def main():
-    token = get_token()
-    df = fetch_sample(token)
+    conn = get_connection()
+    try:
+        df = fetch_sample(conn)
+    finally:
+        conn.close()
 
     os.makedirs(OUT_DIR, exist_ok=True)
     df.to_csv(OUT_PATH, index=False)
