@@ -45,10 +45,15 @@ LEGACY_URL  = "https://oedi-data-lake.s3.amazonaws.com/pvdaq/csv/systems_2024123
 RICH_S3_KEY = "pvdaq/csv/systems_20250729.csv"
 META_PREFIX = "pvdaq/csv/system_metadata/"
 
-OUT_DIR      = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
-LEGACY_PATH  = os.path.join(OUT_DIR, "pvdaq_systems_metadata.csv")
-RICH_PATH    = os.path.join(OUT_DIR, "pvdaq_systems_rich_metadata.csv")
-JSON_DIR     = os.path.join(OUT_DIR, "pvdaq_system_jsons")
+OUT_DIR         = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
+LEGACY_PATH     = os.path.join(OUT_DIR, "pvdaq_systems_metadata.csv")
+RICH_PATH       = os.path.join(OUT_DIR, "pvdaq_systems_rich_metadata.csv")
+JSON_DIR        = os.path.join(OUT_DIR, "pvdaq_system_jsons")
+CANDIDATE_PATH  = os.path.join(OUT_DIR, "pvdaq_candidate_systems.csv")
+
+# Continental US bounding box (excludes Hawaii, Alaska, Puerto Rico, etc.)
+CONUS_LAT = (24.0, 50.0)
+CONUS_LON = (-125.0, -66.0)
 
 # Keywords that indicate a dedicated on-site sensor (not just an inverter channel)
 IRRADIANCE_KEYWORDS = {
@@ -345,6 +350,143 @@ def summarise(df_legacy: pd.DataFrame, df_rich: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
+# Step 5: Filter candidate systems and save
+# ---------------------------------------------------------------------------
+
+def filter_candidates(df_rich: pd.DataFrame,
+                      df_sensors: pd.DataFrame | None) -> pd.DataFrame:
+    """
+    Apply four filters to the rich metadata and return a candidate DataFrame.
+
+    Filters
+    -------
+    1. qa_status == 'pass'
+    2. dc_capacity_kW <= 20  (residential scale)
+    3. years >= 1.0          (at least one full calendar year of data)
+    4. CONUS lat/lon bounds  (excludes Hawaii, Alaska, Puerto Rico, etc.)
+
+    Output columns
+    --------------
+    system_id, state, dc_capacity_kW, years, latitude, longitude,
+    available_sensor_channels, has_weather_sensors
+    """
+    df = df_rich.copy()
+
+    # ---- extract state from "City, ST" location strings ----
+    df["state"] = df["site_location"].str.extract(r",\s*([A-Z]{2})\s*$")
+
+    # ---- apply filters ----
+    mask = (
+        (df["qa_status"] == "pass")
+        & df["dc_capacity_kW"].notna()
+        & (df["dc_capacity_kW"] <= 20)
+        & df["years"].notna()
+        & (df["years"] >= 1.0)
+        & df["latitude"].between(*CONUS_LAT)
+        & df["longitude"].between(*CONUS_LON)
+    )
+    df_cand = df.loc[mask].copy()
+
+    # ---- merge sensor classification ----
+    # The per-system JSON files have empty "Other Instruments" sections for
+    # virtually all systems, so keyword matching returns False everywhere.
+    # Fall back to available_sensor_channels as the primary heuristic:
+    #   - PVOutput crowd-sourced systems typically have 2 channels (AC power + energy)
+    #   - NREL / research systems with dedicated pyranometers/weather stations
+    #     have 10+ channels
+    # This threshold may include systems with many inverters but no irradiance
+    # sensors; those will be identified when time-series data is downloaded.
+    SENSOR_CHANNEL_THRESHOLD = 10
+
+    if df_sensors is not None and not df_sensors.empty:
+        sensor_map = df_sensors.set_index("system_id")[
+            ["has_irradiance", "has_weather"]
+        ]
+        df_cand = df_cand.join(sensor_map, on="system_id", how="left")
+        json_flag = (
+            df_cand["has_irradiance"].fillna(False)
+            | df_cand["has_weather"].fillna(False)
+        )
+    else:
+        json_flag = pd.Series(False, index=df_cand.index)
+
+    channel_flag = (
+        df_cand["available_sensor_channels"].fillna(0) >= SENSOR_CHANNEL_THRESHOLD
+    )
+    df_cand["has_weather_sensors"] = json_flag | channel_flag
+
+    # ---- select and order output columns ----
+    out_cols = [
+        "system_id",
+        "state",
+        "dc_capacity_kW",
+        "years",
+        "latitude",
+        "longitude",
+        "available_sensor_channels",
+        "has_weather_sensors",
+    ]
+    df_cand = (
+        df_cand[out_cols]
+        .sort_values(["has_weather_sensors", "years"], ascending=[False, False])
+        .reset_index(drop=True)
+    )
+    return df_cand
+
+
+def print_and_save_candidates(df_cand: pd.DataFrame) -> None:
+    """Print the filtered candidate list and save it to CSV."""
+    print_separator("CANDIDATE SYSTEMS FOR DOWNLOAD")
+    print(f"Filters applied:")
+    print(f"  qa_status == 'pass'")
+    print(f"  dc_capacity_kW <= 20  (residential scale)")
+    print(f"  years >= 1.0          (at least 1 full year of data)")
+    print(f"  CONUS lat {CONUS_LAT[0]}-{CONUS_LAT[1]}, "
+          f"lon {CONUS_LON[0]} to {CONUS_LON[1]}")
+    print(f"\nTotal candidates: {len(df_cand):,}")
+
+    n_with_sensors = df_cand["has_weather_sensors"].sum()
+    print(f"  With on-site weather/irradiance sensors: "
+          f"{n_with_sensors:,} ({100*n_with_sensors/len(df_cand):.1f}%)")
+    print(f"  Without dedicated sensors:               "
+          f"{len(df_cand) - n_with_sensors:,}")
+
+    # Summary stats on the candidate set
+    print(f"\nCapacity (kW): "
+          f"min={df_cand['dc_capacity_kW'].min():.2f}, "
+          f"median={df_cand['dc_capacity_kW'].median():.2f}, "
+          f"max={df_cand['dc_capacity_kW'].max():.2f}")
+    print(f"Years of data: "
+          f"min={df_cand['years'].min():.2f}, "
+          f"median={df_cand['years'].median():.2f}, "
+          f"max={df_cand['years'].max():.2f}")
+
+    # State breakdown within candidates
+    state_counts = (
+        df_cand["state"]
+        .value_counts(dropna=False)
+        .rename_axis("state")
+        .reset_index(name="candidates")
+    )
+    print(f"\nCandidates by state ({state_counts['state'].nunique()} states):")
+    print(state_counts.to_string(index=False))
+
+    # Full table — with_sensors first, then sorted by years desc
+    print(f"\nFull candidate list (sorted: sensors first, then years desc):")
+    pd.set_option("display.max_rows", None)
+    pd.set_option("display.width", 120)
+    pd.set_option("display.float_format", "{:.3f}".format)
+    print(df_cand.to_string(index=True))
+    pd.reset_option("display.max_rows")
+    pd.reset_option("display.float_format")
+
+    # Save
+    df_cand.to_csv(CANDIDATE_PATH, index=False)
+    print(f"\nSaved {len(df_cand):,} candidates -> {CANDIDATE_PATH}")
+    print_separator()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -357,6 +499,9 @@ def main():
     df_sensors = classify_sensors(json_recs) if json_recs else None
 
     summarise(df_legacy, df_rich, df_sensors)
+
+    df_cand = filter_candidates(df_rich, df_sensors)
+    print_and_save_candidates(df_cand)
 
 
 if __name__ == "__main__":
