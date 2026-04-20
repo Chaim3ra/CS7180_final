@@ -34,7 +34,7 @@ import os
 import re
 
 import boto3
-import pandas as pd
+import polars as pl
 import requests
 from botocore.handlers import disable_signing
 
@@ -63,7 +63,6 @@ GRID_RES        = 0.1     # degrees — cell size for geographic diversity grid
 CONUS_LAT = (24.0, 50.0)
 CONUS_LON = (-125.0, -66.0)
 
-# Keywords that indicate a dedicated on-site sensor (not just an inverter channel)
 IRRADIANCE_KEYWORDS = {
     "poa", "ghi", "dni", "dhi", "irradiance", "pyranometer",
 }
@@ -84,20 +83,28 @@ def get_bucket():
     return s3.Bucket(BUCKET_NAME)
 
 
-def s3_read_csv(bucket, key: str) -> pd.DataFrame:
-    """Download a CSV from S3 into a DataFrame without touching disk."""
+def s3_read_csv(bucket, key: str) -> pl.DataFrame:
+    """Download a CSV from S3 into a Polars DataFrame without touching disk.
+
+    Args:
+        bucket: Boto3 Bucket resource.
+        key: S3 object key.
+
+    Returns:
+        Polars DataFrame parsed from the CSV body.
+    """
     body = bucket.Object(key).get()["Body"].read().decode("utf-8", errors="replace")
-    return pd.read_csv(io.StringIO(body))
+    return pl.read_csv(io.StringIO(body))
 
 
 # ---------------------------------------------------------------------------
 # Step 1: Download legacy snapshot via HTTPS
 # ---------------------------------------------------------------------------
 
-def fetch_legacy_metadata() -> pd.DataFrame:
+def fetch_legacy_metadata() -> pl.DataFrame:
     if os.path.exists(LEGACY_PATH):
         print(f"[1] Cache hit  -> {LEGACY_PATH}")
-        return pd.read_csv(LEGACY_PATH)
+        return pl.read_csv(LEGACY_PATH)
 
     print(f"[1] Downloading {LEGACY_URL} ...")
     r = requests.get(LEGACY_URL, timeout=30)
@@ -106,25 +113,25 @@ def fetch_legacy_metadata() -> pd.DataFrame:
     with open(LEGACY_PATH, "wb") as f:
         f.write(r.content)
     print(f"    Saved {len(r.content):,} bytes -> {LEGACY_PATH}")
-    return pd.read_csv(LEGACY_PATH)
+    return pl.read_csv(LEGACY_PATH)
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Download rich metadata via boto3 (pvdaq_access pattern)
+# Step 2: Download rich metadata via boto3
 # ---------------------------------------------------------------------------
 
-def fetch_rich_metadata(bucket) -> pd.DataFrame:
+def fetch_rich_metadata(bucket) -> pl.DataFrame:
     if os.path.exists(RICH_PATH):
         print(f"[2] Cache hit  -> {RICH_PATH}")
-        df = pd.read_csv(RICH_PATH)
-    else:
-        print(f"[2] Downloading s3://{BUCKET_NAME}/{RICH_S3_KEY} via boto3 ...")
-        df = s3_read_csv(bucket, RICH_S3_KEY)
-        # Drop unnamed trailing columns from spreadsheet artifacts
-        df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
-        os.makedirs(OUT_DIR, exist_ok=True)
-        df.to_csv(RICH_PATH, index=False)
-        print(f"    Saved {len(df):,} rows -> {RICH_PATH}")
+        return pl.read_csv(RICH_PATH)
+
+    print(f"[2] Downloading s3://{BUCKET_NAME}/{RICH_S3_KEY} via boto3 ...")
+    df = s3_read_csv(bucket, RICH_S3_KEY)
+    # Drop unnamed trailing columns from spreadsheet artifacts
+    df = df.select([c for c in df.columns if not c.startswith("Unnamed")])
+    os.makedirs(OUT_DIR, exist_ok=True)
+    df.write_csv(RICH_PATH)
+    print(f"    Saved {len(df):,} rows -> {RICH_PATH}")
     return df
 
 
@@ -133,10 +140,15 @@ def fetch_rich_metadata(bucket) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def fetch_system_jsons(bucket) -> list[dict]:
-    """
-    Paginate system_metadata/ in S3 and download all *_system_metadata.json
-    files (each ~2 KB). Results are cached on disk in data/raw/pvdaq_system_jsons/.
-    Returns a list of parsed JSON dicts.
+    """Paginate system_metadata/ in S3 and download all per-system JSON files.
+
+    Results are cached on disk in ``data/raw/pvdaq_system_jsons/``.
+
+    Args:
+        bucket: Boto3 Bucket resource.
+
+    Returns:
+        List of parsed JSON dicts, one per system.
     """
     os.makedirs(JSON_DIR, exist_ok=True)
     paginator = bucket.meta.client.get_paginator("list_objects_v2")
@@ -187,22 +199,28 @@ def has_sensor(instruments: dict, keywords: set) -> bool:
     return False
 
 
-def classify_sensors(records: list[dict]) -> pd.DataFrame:
-    """
-    Build a per-system sensor classification DataFrame from the JSON records.
-    Checks 'Other Instruments' and 'Meters' sections for irradiance/weather sensors.
+def classify_sensors(records: list[dict]) -> pl.DataFrame:
+    """Build a per-system sensor classification DataFrame from JSON records.
+
+    Checks ``Other Instruments`` and ``Meters`` sections for irradiance and
+    weather sensors.
+
+    Args:
+        records: List of parsed per-system JSON dicts.
+
+    Returns:
+        Polars DataFrame with columns:
+        ``system_id``, ``has_irradiance``, ``has_weather``, ``other_instruments``.
     """
     rows = []
     for rec in records:
-        sys_info  = rec.get("System", {})
-        other     = rec.get("Other Instruments", {})
-        meters    = rec.get("Meters", {})
-        metrics   = rec.get("Metrics", {})
+        sys_info = rec.get("System", {})
+        other    = rec.get("Other Instruments", {})
+        meters   = rec.get("Meters", {})
+        metrics  = rec.get("Metrics", {})
 
-        # Combine all non-inverter/non-module instrument dicts
         all_instruments = {**other, **meters}
 
-        # Also scan metric sensor names for irradiance channels
         metric_names = " ".join(
             str(m.get("sensor_name", "")) for m in metrics.values()
         ).lower()
@@ -215,7 +233,9 @@ def classify_sensors(records: list[dict]) -> pd.DataFrame:
             "has_weather":       has_sensor(all_instruments, WEATHER_KEYWORDS)    or has_wth_metric,
             "other_instruments": len(other),
         })
-    return pd.DataFrame(rows)
+    return pl.from_dicts(rows) if rows else pl.DataFrame(
+        {"system_id": [], "has_irradiance": [], "has_weather": [], "other_instruments": []}
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -231,9 +251,18 @@ def print_separator(title=""):
         print("=" * width)
 
 
-def summarise(df_legacy: pd.DataFrame, df_rich: pd.DataFrame,
-              df_sensors: pd.DataFrame | None) -> None:
+def summarise(
+    df_legacy: pl.DataFrame,
+    df_rich: pl.DataFrame,
+    df_sensors: pl.DataFrame | None,
+) -> None:
+    """Print a comprehensive analysis of PVDAQ system metadata.
 
+    Args:
+        df_legacy: Legacy snapshot DataFrame (systems_20241231.csv).
+        df_rich: Rich metadata DataFrame (systems_20250729.csv).
+        df_sensors: Per-system sensor classification, or ``None``.
+    """
     # ------------------------------------------------------------------
     # 1. Overview
     # ------------------------------------------------------------------
@@ -248,27 +277,29 @@ def summarise(df_legacy: pd.DataFrame, df_rich: pd.DataFrame,
         print(f"  {c}")
 
     # ------------------------------------------------------------------
-    # 2. State breakdown (rich file — more complete)
+    # 2. State breakdown
     # ------------------------------------------------------------------
     print_separator("SYSTEMS BY STATE")
-    df_rich = df_rich.copy()
-    df_rich["state"] = df_rich["site_location"].str.extract(r",\s*([A-Z]{2})\s*$")
+    df_rich = df_rich.with_columns(
+        pl.col("site_location")
+        .str.extract(r",\s*([A-Z]{2})\s*$", group_index=1)
+        .alias("state")
+    )
     state_counts = (
         df_rich["state"]
-        .value_counts()
-        .rename_axis("state")
-        .reset_index(name="systems")
+        .value_counts(sort=True)
+        .rename({"state": "state", "count": "systems"})
     )
-    n_states = state_counts["state"].nunique()
+    n_states = df_rich["state"].n_unique()
     print(f"{len(df_rich):,} systems across {n_states} states/territories:\n")
-    print(state_counts.to_string(index=False))
+    print(state_counts)
 
     # ------------------------------------------------------------------
-    # 3. System size distribution (dc_capacity_kW)
+    # 3. System size distribution
     # ------------------------------------------------------------------
     print_separator("SYSTEM SIZE  (dc_capacity_kW)")
     if "dc_capacity_kW" in df_rich.columns:
-        kw = df_rich["dc_capacity_kW"].dropna()
+        kw = df_rich["dc_capacity_kW"].drop_nulls()
         print(f"Systems with known capacity: {len(kw):,} / {len(df_rich):,}")
         print(f"  min    : {kw.min():.3f} kW")
         print(f"  p25    : {kw.quantile(0.25):.3f} kW")
@@ -277,15 +308,27 @@ def summarise(df_legacy: pd.DataFrame, df_rich: pd.DataFrame,
         print(f"  p75    : {kw.quantile(0.75):.3f} kW")
         print(f"  max    : {kw.max():.3f} kW")
 
-        # Capacity tiers
-        bins   = [0, 10, 100, 1000, float("inf")]
-        labels = ["<10 kW (residential)", "10-100 kW (small commercial)",
-                  "100-1000 kW (commercial)", ">1 MW (utility)"]
-        df_rich["capacity_tier"] = pd.cut(kw, bins=bins, labels=labels)
-        tier_counts = df_rich["capacity_tier"].value_counts().sort_index()
+        df_rich = df_rich.with_columns(
+            pl.col("dc_capacity_kW")
+            .cut(
+                breaks=[10, 100, 1000],
+                labels=[
+                    "<10 kW (residential)",
+                    "10-100 kW (small commercial)",
+                    "100-1000 kW (commercial)",
+                    ">1 MW (utility)",
+                ],
+            )
+            .alias("capacity_tier")
+        )
+        tier_counts = (
+            df_rich.group_by("capacity_tier")
+            .len()
+            .sort("capacity_tier")
+        )
         print("\nCapacity tiers:")
-        for tier, count in tier_counts.items():
-            print(f"  {tier}: {count:,}")
+        for row in tier_counts.rows(named=True):
+            print(f"  {row['capacity_tier']}: {row['len']:,}")
     else:
         print("  dc_capacity_kW not present in this snapshot.")
 
@@ -294,63 +337,62 @@ def summarise(df_legacy: pd.DataFrame, df_rich: pd.DataFrame,
     # ------------------------------------------------------------------
     print_separator("DATA COVERAGE")
     for col in ("first_timestamp", "last_timestamp"):
-        col_name = col if col in df_rich.columns else None
-        if col_name:
-            parsed = pd.to_datetime(df_rich[col_name], format="%m/%d/%Y %H:%M",
-                                    errors="coerce")
-            print(f"  {col}: {parsed.min().date()} -> {parsed.max().date()}")
+        if col in df_rich.columns:
+            parsed = df_rich[col].str.to_datetime(
+                format="%m/%d/%Y %H:%M", strict=False
+            )
+            print(f"  {col}: {parsed.min()} -> {parsed.max()}")
     if "years" in df_rich.columns:
-        yr = df_rich["years"].dropna()
+        yr = df_rich["years"].drop_nulls()
         print(f"  Years of data per system: "
               f"min={yr.min():.2f}, median={yr.median():.2f}, max={yr.max():.2f}")
 
-    # Tracking type breakdown
     if "tracking" in df_rich.columns:
         print_separator("TRACKING TYPE")
-        print(df_rich["tracking"].value_counts().rename_axis("tracking").reset_index(
-            name="systems").to_string(index=False))
+        print(df_rich["tracking"].value_counts(sort=True))
 
-    # Mount type breakdown
     if "type" in df_rich.columns:
         print_separator("MOUNT TYPE")
-        print(df_rich["type"].value_counts().rename_axis("type").reset_index(
-            name="systems").to_string(index=False))
+        print(df_rich["type"].value_counts(sort=True))
 
-    # QA status
     if "qa_status" in df_rich.columns:
         print_separator("QA STATUS")
-        print(df_rich["qa_status"].value_counts().rename_axis("qa_status").reset_index(
-            name="systems").to_string(index=False))
+        print(df_rich["qa_status"].value_counts(sort=True))
 
     # ------------------------------------------------------------------
     # 5. On-site irradiance / weather sensors
     # ------------------------------------------------------------------
     print_separator("ON-SITE IRRADIANCE / WEATHER SENSORS")
-    if df_sensors is not None and not df_sensors.empty:
+    if df_sensors is not None and not df_sensors.is_empty():
         n_total  = len(df_sensors)
         n_irr    = df_sensors["has_irradiance"].sum()
         n_wth    = df_sensors["has_weather"].sum()
-        n_either = (df_sensors["has_irradiance"] | df_sensors["has_weather"]).sum()
+        n_either = (
+            df_sensors
+            .select(
+                (pl.col("has_irradiance") | pl.col("has_weather")).alias("either")
+            )["either"]
+            .sum()
+        )
         print(f"Systems with per-JSON metadata: {n_total:,}")
         print(f"  Has irradiance sensor : {n_irr:,}  ({100*n_irr/n_total:.1f}%)")
         print(f"  Has weather sensor    : {n_wth:,}  ({100*n_wth/n_total:.1f}%)")
         print(f"  Has either            : {n_either:,}  ({100*n_either/n_total:.1f}%)")
 
-        # Sensor channel proxy for the broader dataset
         if "available_sensor_channels" in df_rich.columns:
-            ch = df_rich["available_sensor_channels"].dropna()
+            ch = df_rich["available_sensor_channels"].drop_nulls()
             print(f"\navailable_sensor_channels across all {len(ch):,} systems:")
             print(f"  min={ch.min():.0f}, median={ch.median():.0f}, max={ch.max():.0f}")
-            threshold = 10   # heuristic: >10 channels usually means dedicated sensors
-            n_likely  = (ch >= threshold).sum()
+            threshold = 10
+            n_likely = (ch >= threshold).sum()
             print(f"  Systems with >= {threshold} channels (likely have dedicated sensors): "
                   f"{n_likely:,} ({100*n_likely/len(ch):.1f}%)")
     else:
         print("  No per-system JSON metadata available for sensor analysis.")
         if "available_sensor_channels" in df_rich.columns:
-            ch = df_rich["available_sensor_channels"].dropna()
+            ch = df_rich["available_sensor_channels"].drop_nulls()
             threshold = 10
-            n_likely  = (ch >= threshold).sum()
+            n_likely = (ch >= threshold).sum()
             print(f"\n  Proxy via available_sensor_channels >= {threshold}: "
                   f"{n_likely:,} / {len(ch):,} systems ({100*n_likely/len(ch):.1f}%)")
 
@@ -361,10 +403,11 @@ def summarise(df_legacy: pd.DataFrame, df_rich: pd.DataFrame,
 # Step 5: Filter candidate systems and save
 # ---------------------------------------------------------------------------
 
-def filter_candidates(df_rich: pd.DataFrame,
-                      df_sensors: pd.DataFrame | None) -> pd.DataFrame:
-    """
-    Apply four filters to the rich metadata and return a candidate DataFrame.
+def filter_candidates(
+    df_rich: pl.DataFrame,
+    df_sensors: pl.DataFrame | None,
+) -> pl.DataFrame:
+    """Apply four filters to the rich metadata and return a candidate DataFrame.
 
     Filters
     -------
@@ -373,77 +416,75 @@ def filter_candidates(df_rich: pd.DataFrame,
     3. years >= 1.0          (at least one full calendar year of data)
     4. CONUS lat/lon bounds  (excludes Hawaii, Alaska, Puerto Rico, etc.)
 
-    Output columns
-    --------------
-    system_id, state, dc_capacity_kW, years, latitude, longitude,
-    available_sensor_channels, has_weather_sensors
+    Args:
+        df_rich: Rich metadata Polars DataFrame.
+        df_sensors: Per-system sensor classification, or ``None``.
+
+    Returns:
+        Filtered candidate DataFrame with columns:
+        ``system_id``, ``state``, ``dc_capacity_kW``, ``years``,
+        ``latitude``, ``longitude``, ``available_sensor_channels``,
+        ``has_weather_sensors``.
     """
-    df = df_rich.copy()
-
-    # ---- extract state from "City, ST" location strings ----
-    df["state"] = df["site_location"].str.extract(r",\s*([A-Z]{2})\s*$")
-
-    # ---- apply filters ----
-    mask = (
-        (df["qa_status"] == "pass")
-        & df["dc_capacity_kW"].notna()
-        & (df["dc_capacity_kW"] <= 20)
-        & df["years"].notna()
-        & (df["years"] >= 1.0)
-        & df["latitude"].between(*CONUS_LAT)
-        & df["longitude"].between(*CONUS_LON)
+    df = df_rich.with_columns(
+        pl.col("site_location")
+        .str.extract(r",\s*([A-Z]{2})\s*$", group_index=1)
+        .alias("state")
     )
-    df_cand = df.loc[mask].copy()
 
-    # ---- merge sensor classification ----
-    # The per-system JSON files have empty "Other Instruments" sections for
-    # virtually all systems, so keyword matching returns False everywhere.
-    # Fall back to available_sensor_channels as the primary heuristic:
-    #   - PVOutput crowd-sourced systems typically have 2 channels (AC power + energy)
-    #   - NREL / research systems with dedicated pyranometers/weather stations
-    #     have 10+ channels
-    # This threshold may include systems with many inverters but no irradiance
-    # sensors; those will be identified when time-series data is downloaded.
+    df_cand = df.filter(
+        (pl.col("qa_status") == "pass")
+        & pl.col("dc_capacity_kW").is_not_null()
+        & (pl.col("dc_capacity_kW") <= 20)
+        & pl.col("years").is_not_null()
+        & (pl.col("years") >= 1.0)
+        & pl.col("latitude").is_between(CONUS_LAT[0], CONUS_LAT[1])
+        & pl.col("longitude").is_between(CONUS_LON[0], CONUS_LON[1])
+    )
+
     SENSOR_CHANNEL_THRESHOLD = 10
 
-    if df_sensors is not None and not df_sensors.empty:
-        sensor_map = df_sensors.set_index("system_id")[
-            ["has_irradiance", "has_weather"]
-        ]
-        df_cand = df_cand.join(sensor_map, on="system_id", how="left")
+    if df_sensors is not None and not df_sensors.is_empty():
+        df_cand = df_cand.join(
+            df_sensors.select(["system_id", "has_irradiance", "has_weather"]),
+            on="system_id",
+            how="left",
+        )
         json_flag = (
-            df_cand["has_irradiance"].fillna(False)
-            | df_cand["has_weather"].fillna(False)
+            pl.col("has_irradiance").fill_null(False)
+            | pl.col("has_weather").fill_null(False)
         )
     else:
-        json_flag = pd.Series(False, index=df_cand.index)
+        df_cand = df_cand.with_columns([
+            pl.lit(False).alias("has_irradiance"),
+            pl.lit(False).alias("has_weather"),
+        ])
+        json_flag = pl.lit(False)
 
-    channel_flag = (
-        df_cand["available_sensor_channels"].fillna(0) >= SENSOR_CHANNEL_THRESHOLD
+    df_cand = df_cand.with_columns(
+        (
+            json_flag
+            | (pl.col("available_sensor_channels").fill_null(0) >= SENSOR_CHANNEL_THRESHOLD)
+        ).alias("has_weather_sensors")
     )
-    df_cand["has_weather_sensors"] = json_flag | channel_flag
 
-    # ---- select and order output columns ----
     out_cols = [
-        "system_id",
-        "state",
-        "dc_capacity_kW",
-        "years",
-        "latitude",
-        "longitude",
-        "available_sensor_channels",
-        "has_weather_sensors",
+        "system_id", "state", "dc_capacity_kW", "years",
+        "latitude", "longitude", "available_sensor_channels", "has_weather_sensors",
     ]
-    df_cand = (
-        df_cand[out_cols]
-        .sort_values(["has_weather_sensors", "years"], ascending=[False, False])
-        .reset_index(drop=True)
+    return (
+        df_cand
+        .select(out_cols)
+        .sort(["has_weather_sensors", "years"], descending=[True, True])
     )
-    return df_cand
 
 
-def print_and_save_candidates(df_cand: pd.DataFrame) -> None:
-    """Print the filtered candidate list and save it to CSV."""
+def print_and_save_candidates(df_cand: pl.DataFrame) -> None:
+    """Print the filtered candidate list and save it to CSV.
+
+    Args:
+        df_cand: Filtered candidate Polars DataFrame.
+    """
     print_separator("CANDIDATE SYSTEMS FOR DOWNLOAD")
     print(f"Filters applied:")
     print(f"  qa_status == 'pass'")
@@ -459,37 +500,22 @@ def print_and_save_candidates(df_cand: pd.DataFrame) -> None:
     print(f"  Without dedicated sensors:               "
           f"{len(df_cand) - n_with_sensors:,}")
 
-    # Summary stats on the candidate set
+    cap = df_cand["dc_capacity_kW"]
     print(f"\nCapacity (kW): "
-          f"min={df_cand['dc_capacity_kW'].min():.2f}, "
-          f"median={df_cand['dc_capacity_kW'].median():.2f}, "
-          f"max={df_cand['dc_capacity_kW'].max():.2f}")
+          f"min={cap.min():.2f}, median={cap.median():.2f}, max={cap.max():.2f}")
+    yrs = df_cand["years"]
     print(f"Years of data: "
-          f"min={df_cand['years'].min():.2f}, "
-          f"median={df_cand['years'].median():.2f}, "
-          f"max={df_cand['years'].max():.2f}")
+          f"min={yrs.min():.2f}, median={yrs.median():.2f}, max={yrs.max():.2f}")
 
-    # State breakdown within candidates
-    state_counts = (
-        df_cand["state"]
-        .value_counts(dropna=False)
-        .rename_axis("state")
-        .reset_index(name="candidates")
-    )
-    print(f"\nCandidates by state ({state_counts['state'].nunique()} states):")
-    print(state_counts.to_string(index=False))
+    state_counts = df_cand["state"].value_counts(sort=True)
+    print(f"\nCandidates by state ({df_cand['state'].n_unique()} states):")
+    print(state_counts)
 
-    # Full table — with_sensors first, then sorted by years desc
     print(f"\nFull candidate list (sorted: sensors first, then years desc):")
-    pd.set_option("display.max_rows", None)
-    pd.set_option("display.width", 120)
-    pd.set_option("display.float_format", "{:.3f}".format)
-    print(df_cand.to_string(index=True))
-    pd.reset_option("display.max_rows")
-    pd.reset_option("display.float_format")
+    with pl.Config(tbl_rows=len(df_cand), tbl_width_chars=120):
+        print(df_cand)
 
-    # Save
-    df_cand.to_csv(CANDIDATE_PATH, index=False)
+    df_cand.write_csv(CANDIDATE_PATH)
     print(f"\nSaved {len(df_cand):,} candidates -> {CANDIDATE_PATH}")
     print_separator()
 
@@ -498,26 +524,26 @@ def print_and_save_candidates(df_cand: pd.DataFrame) -> None:
 # Step 6: Probe S3 for sensor-candidate systems and select top 50
 # ---------------------------------------------------------------------------
 
-# Regex for annual corrected file:  {sid}_ac_{YYYY}0101_{YYYY}1231_corrected.csv
 _ANNUAL_RE = re.compile(r"_ac_(\d{4})0101_(\d{4})1231_corrected\.csv$")
-# Regex for NREL daily file:        system_{sid}__date_{YYYY}_{MM}_{DD}.csv
 _DAILY_RE  = re.compile(r"__date_(\d{4})_\d{2}_\d{2}\.csv$")
 
 
 def _make_client():
-    """Create a new unsigned S3 client. Must be called per-thread."""
+    """Create a new unsigned S3 client (one per thread)."""
     client = boto3.client("s3", region_name="us-west-2")
     client.meta.events.register("choose-signer.s3.*", disable_signing)
     return client
 
 
 def probe_system_s3(sid: int) -> dict:
-    """
-    List S3 objects under pvdaq/csv/pvdata/system_id={sid}/ and determine
-    the best downloadable year.
+    """List S3 objects under ``pvdaq/csv/pvdata/system_id={sid}/``.
 
-    Returns a dict with keys:
-        system_id, has_data, file_format, best_year, size_mb, n_files, error
+    Args:
+        sid: PVDAQ system ID.
+
+    Returns:
+        Dict with keys: ``system_id``, ``has_data``, ``file_format``,
+        ``best_year``, ``size_mb``, ``n_files``, ``error``.
     """
     client  = _make_client()
     prefix  = f"{PVDATA_PREFIX}system_id={sid}/"
@@ -527,7 +553,6 @@ def probe_system_s3(sid: int) -> dict:
     try:
         paginator = client.get_paginator("list_objects_v2")
         pages = paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefix)
-
         all_objects = []
         for page in pages:
             for obj in page.get("Contents", []):
@@ -540,19 +565,16 @@ def probe_system_s3(sid: int) -> dict:
 
     base["n_files"] = len(all_objects)
 
-    # ----- Detect annual corrected files -----
-    annual_years: dict[int, tuple[str, int]] = {}  # year -> (key, size_bytes)
-    daily_year_bytes: dict[int, int] = {}           # year -> cumulative bytes
+    annual_years: dict[int, tuple[str, int]] = {}
+    daily_year_bytes: dict[int, int] = {}
 
     for key, size in all_objects:
         fname = key.rsplit("/", 1)[-1]
-
         m_ann = _ANNUAL_RE.search(fname)
-        if m_ann and m_ann.group(1) == m_ann.group(2):  # start_year == end_year
+        if m_ann and m_ann.group(1) == m_ann.group(2):
             year = int(m_ann.group(1))
             annual_years[year] = (key, size)
             continue
-
         m_day = _DAILY_RE.search(fname)
         if m_day:
             year = int(m_day.group(1))
@@ -560,7 +582,7 @@ def probe_system_s3(sid: int) -> dict:
 
     if annual_years:
         best_year = max(annual_years)
-        best_key, best_bytes = annual_years[best_year]
+        _, best_bytes = annual_years[best_year]
         return {
             **base,
             "has_data":    True,
@@ -571,24 +593,32 @@ def probe_system_s3(sid: int) -> dict:
 
     if daily_year_bytes:
         best_year = max(daily_year_bytes, key=daily_year_bytes.get)
-        total_mb  = daily_year_bytes[best_year] / 1_048_576
         return {
             **base,
             "has_data":    True,
             "file_format": "daily",
             "best_year":   best_year,
-            "size_mb":     round(total_mb, 2),
+            "size_mb":     round(daily_year_bytes[best_year] / 1_048_576, 2),
         }
 
     return {**base, "error": "no annual or daily files matched"}
 
 
-def build_s3_inventory(df_cand: pd.DataFrame, max_workers: int = 20) -> pd.DataFrame:
+def build_s3_inventory(df_cand: pl.DataFrame, max_workers: int = 20) -> pl.DataFrame:
+    """Probe S3 for every sensor-candidate system using a thread pool.
+
+    Args:
+        df_cand: Candidate systems Polars DataFrame.
+        max_workers: Thread pool size.
+
+    Returns:
+        Polars DataFrame with one row per system and S3 inventory info.
     """
-    Probe S3 for every sensor candidate system using a thread pool.
-    Returns a DataFrame with one row per system.
-    """
-    sensor_sids = df_cand.loc[df_cand["has_weather_sensors"], "system_id"].tolist()
+    sensor_sids = (
+        df_cand
+        .filter(pl.col("has_weather_sensors"))["system_id"]
+        .to_list()
+    )
     n = len(sensor_sids)
     print(f"\n[6] Probing S3 inventory for {n} sensor-candidate systems ...")
 
@@ -604,55 +634,57 @@ def build_s3_inventory(df_cand: pd.DataFrame, max_workers: int = 20) -> pd.DataF
                 )
                 print(f"    {i}/{n} probed — {within} viable so far")
 
-    df_inv = pd.DataFrame(results)
-    # Attach lat/lon/state/years from candidates for the selection step
-    meta = df_cand[["system_id", "state", "latitude", "longitude",
-                    "years", "dc_capacity_kW"]].copy()
-    df_inv = df_inv.merge(meta, on="system_id", how="left")
-    return df_inv
+    df_inv = pl.from_dicts(results)
+    meta = df_cand.select(
+        ["system_id", "state", "latitude", "longitude", "years", "dc_capacity_kW"]
+    )
+    return df_inv.join(meta, on="system_id", how="left")
 
 
-def select_top_50(df_inv: pd.DataFrame) -> pd.DataFrame:
+def select_top_50(df_inv: pl.DataFrame) -> pl.DataFrame:
+    """Select up to ``TARGET_COUNT`` systems with geographic diversity.
+
+    Filters to viable systems (has data and within ``MAX_SIZE_MB``), assigns
+    each to a ``GRID_RES``-degree lat/lon cell, then greedily selects one
+    representative per cell before filling remaining slots with the best
+    unselected systems.
+
+    Args:
+        df_inv: S3 inventory Polars DataFrame from :func:`build_s3_inventory`.
+
+    Returns:
+        Polars DataFrame of selected systems.
     """
-    Select up to TARGET_COUNT systems from the S3 inventory that:
-      - have at least one viable file (has_data=True)
-      - have estimated year size <= MAX_SIZE_MB
+    viable = df_inv.filter(
+        pl.col("has_data").fill_null(False)
+        & (pl.col("size_mb").fill_null(float("inf")) <= MAX_SIZE_MB)
+    )
 
-    Selection prioritises geographic diversity using a GRID_RES-degree
-    lat/lon grid, then fills remaining slots with the best remaining systems
-    (sorted by years desc, most recent year desc, size asc).
-    """
-    # Viable: has data and within storage budget
-    viable = df_inv[
-        df_inv["has_data"].fillna(False)
-        & (df_inv["size_mb"].fillna(float("inf")) <= MAX_SIZE_MB)
-    ].copy()
-
-    if viable.empty:
+    if viable.is_empty():
         print("  WARNING: no viable systems within size budget.")
         return viable
 
-    # Assign grid cell
-    viable["grid_lat"] = (viable["latitude"] / GRID_RES).round(0) * GRID_RES
-    viable["grid_lon"] = (viable["longitude"] / GRID_RES).round(0) * GRID_RES
-    viable["grid_cell"] = (
-        viable["grid_lat"].map(lambda x: f"{x:.1f}")
-        + "_"
-        + viable["grid_lon"].map(lambda x: f"{x:.1f}")
+    viable = (
+        viable
+        .with_columns([
+            ((pl.col("latitude")  / GRID_RES).round(0) * GRID_RES).alias("grid_lat"),
+            ((pl.col("longitude") / GRID_RES).round(0) * GRID_RES).alias("grid_lon"),
+        ])
+        .with_columns(
+            (
+                pl.col("grid_lat").map_elements(lambda x: f"{x:.1f}", return_dtype=pl.String)
+                + pl.lit("_")
+                + pl.col("grid_lon").map_elements(lambda x: f"{x:.1f}", return_dtype=pl.String)
+            ).alias("grid_cell")
+        )
+        .sort(["years", "best_year", "size_mb"], descending=[True, True, False])
     )
 
-    # Sort: most years first, most recent best_year first, smallest file first
-    viable = viable.sort_values(
-        ["years", "best_year", "size_mb"],
-        ascending=[False, False, True],
-    ).reset_index(drop=True)
+    selected_rows: list[dict] = []
+    used_cells:    set[str]   = set()
+    used_ids:      set[int]   = set()
 
-    selected_rows: list[pd.Series] = []
-    used_cells:    set[str]        = set()
-    used_ids:      set[int]        = set()
-
-    # Pass 1 — one representative per grid cell
-    for _, row in viable.iterrows():
+    for row in viable.rows(named=True):
         if len(selected_rows) >= TARGET_COUNT:
             break
         cell = row["grid_cell"]
@@ -661,61 +693,56 @@ def select_top_50(df_inv: pd.DataFrame) -> pd.DataFrame:
             used_cells.add(cell)
             used_ids.add(row["system_id"])
 
-    # Pass 2 — fill remaining slots with best leftover systems
     if len(selected_rows) < TARGET_COUNT:
-        for _, row in viable.iterrows():
+        for row in viable.rows(named=True):
             if len(selected_rows) >= TARGET_COUNT:
                 break
             if row["system_id"] not in used_ids:
                 selected_rows.append(row)
                 used_ids.add(row["system_id"])
 
-    df_50 = pd.DataFrame(selected_rows).reset_index(drop=True)
-    return df_50
+    return pl.from_dicts(selected_rows)
 
 
-def print_and_save_selected(df_50: pd.DataFrame) -> None:
-    """Print the selected-50 list and save it to SELECTED_PATH."""
+def print_and_save_selected(df_50: pl.DataFrame) -> None:
+    """Print the selected-50 list and save it to ``SELECTED_PATH``.
+
+    Args:
+        df_50: Selected systems Polars DataFrame.
+    """
     print_separator("SELECTED 50 SYSTEMS")
     print(f"Systems selected: {len(df_50)}")
 
-    # State breakdown
-    state_counts = (
-        df_50["state"].value_counts(dropna=False)
-        .rename_axis("state").reset_index(name="count")
-    )
-    print(f"\nStates represented ({state_counts['state'].nunique()}):")
-    print(state_counts.to_string(index=False))
+    if "state" in df_50.columns:
+        state_counts = df_50["state"].value_counts(sort=True)
+        print(f"\nStates represented ({df_50['state'].n_unique()}):")
+        print(state_counts)
 
-    # Format breakdown
     if "file_format" in df_50.columns:
-        fmt_counts = df_50["file_format"].value_counts()
-        print(f"\nFile format: {dict(fmt_counts)}")
+        fmt_counts = df_50["file_format"].value_counts(sort=True)
+        print(f"\nFile format:")
+        print(fmt_counts)
 
-    # Size summary
     if "size_mb" in df_50.columns:
-        mb = df_50["size_mb"].dropna()
+        mb = df_50["size_mb"].drop_nulls()
         print(f"Year file size (MB): min={mb.min():.2f}, "
               f"median={mb.median():.2f}, max={mb.max():.2f}, "
               f"total={mb.sum():.1f}")
 
-    # Full table
     display_cols = [c for c in [
         "system_id", "state", "latitude", "longitude",
         "dc_capacity_kW", "years", "file_format", "best_year", "size_mb",
     ] if c in df_50.columns]
 
     print(f"\nFull list (geographic diversity order):")
-    pd.set_option("display.max_rows", None)
-    pd.set_option("display.width", 140)
-    pd.set_option("display.float_format", "{:.3f}".format)
-    print(df_50[display_cols].to_string(index=True))
-    pd.reset_option("display.max_rows")
-    pd.reset_option("display.float_format")
+    with pl.Config(tbl_rows=len(df_50), tbl_width_chars=140):
+        print(df_50.select(display_cols))
 
-    # Save
-    save_cols = [c for c in df_50.columns if c not in ("grid_lat", "grid_lon", "grid_cell")]
-    df_50[save_cols].to_csv(SELECTED_PATH, index=False)
+    save_cols = [
+        c for c in df_50.columns
+        if c not in ("grid_lat", "grid_lon", "grid_cell")
+    ]
+    df_50.select(save_cols).write_csv(SELECTED_PATH)
     print(f"\nSaved {len(df_50)} systems -> {SELECTED_PATH}")
     print_separator()
 
@@ -737,12 +764,9 @@ def main():
     df_cand = filter_candidates(df_rich, df_sensors)
     print_and_save_candidates(df_cand)
 
-    # ----------------------------------------------------------------
-    # Step 6: Select top 50 systems with geographic diversity
-    # ----------------------------------------------------------------
     if os.path.exists(SELECTED_PATH):
         print(f"\n[6] Cache hit -> {SELECTED_PATH}")
-        df_selected = pd.read_csv(SELECTED_PATH)
+        df_selected = pl.read_csv(SELECTED_PATH)
     else:
         df_inv      = build_s3_inventory(df_cand)
         df_selected = select_top_50(df_inv)

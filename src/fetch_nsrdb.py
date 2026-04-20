@@ -21,7 +21,7 @@ import os
 import sys
 import time
 
-import pandas as pd
+import polars as pl
 import requests
 from dotenv import load_dotenv
 
@@ -67,7 +67,7 @@ TARGETS = [
     {"name": "austin",     "lat": 30.2672,  "lon": -97.7431,  "year": 2018},
     # New York, NY
     {"name": "newyork",    "lat": 40.7128,  "lon": -74.0060,  "year": 2019},
-    # California (San Jose) — 2014-2017 pre-date GOES CONUS coverage and will be skipped
+    # California (San Jose) — 2014-2017 pre-date GOES CONUS coverage
     {"name": "california", "lat": 37.3382,  "lon": -121.8863, "year": 2014},
     {"name": "california", "lat": 37.3382,  "lon": -121.8863, "year": 2015},
     {"name": "california", "lat": 37.3382,  "lon": -121.8863, "year": 2016},
@@ -80,8 +80,23 @@ TARGETS = [
 # Core fetch function
 # ---------------------------------------------------------------------------
 
-def fetch_one(lat: float, lon: float, year: int) -> pd.DataFrame:
-    """Fetch one location/year from the NSRDB API and return a DataFrame."""
+def fetch_one(lat: float, lon: float, year: int) -> pl.DataFrame:
+    """Fetch one location/year from the NSRDB API and return a Polars DataFrame.
+
+    Args:
+        lat: Latitude of the target location.
+        lon: Longitude of the target location.
+        year: Calendar year to fetch.
+
+    Returns:
+        Polars DataFrame with a ``datetime`` column and one column per
+        weather attribute.
+
+    Raises:
+        ValueError: On HTTP 400 (bad request).
+        PermissionError: On HTTP 403 (invalid API key).
+        RuntimeError: On any other non-200 HTTP status.
+    """
     params = {
         "api_key": API_KEY,
         "wkt": f"POINT({lon} {lat})",
@@ -117,16 +132,24 @@ def fetch_one(lat: float, lon: float, year: int) -> pd.DataFrame:
     print(f"       site: lat={meta.get('Latitude')}, lon={meta.get('Longitude')}, "
           f"elev={meta.get('Elevation')} m, tz={meta.get('Time Zone')}")
 
-    df = pd.read_csv(io.StringIO("\n".join(lines[2:])))
+    df = pl.read_csv(io.StringIO("\n".join(lines[2:])))
 
-    # Build a proper datetime index
-    df["datetime"] = pd.to_datetime(
-        df[["Year", "Month", "Day", "Hour"]].astype(str).agg("-".join, axis=1),
-        format="%Y-%m-%d-%H",
-    )
-    df = df.set_index("datetime").drop(
-        columns=["Year", "Month", "Day", "Hour", "Minute"]
-    )
+    # Build a proper datetime column from Year/Month/Day/Hour components.
+    # Zero-pad month/day/hour so Polars' strptime can parse reliably.
+    df = df.with_columns(
+        pl.concat_str(
+            [
+                pl.col("Year").cast(pl.Utf8),
+                pl.col("Month").cast(pl.Utf8).str.zfill(2),
+                pl.col("Day").cast(pl.Utf8).str.zfill(2),
+                pl.col("Hour").cast(pl.Utf8).str.zfill(2),
+            ],
+            separator="-",
+        )
+        .str.to_datetime(format="%Y-%m-%d-%H")
+        .alias("datetime")
+    ).drop(["Year", "Month", "Day", "Hour", "Minute"])
+
     return df
 
 
@@ -149,13 +172,11 @@ def main():
 
         print(f"\n[{i+1}/{len(TARGETS)}] {fname}")
 
-        # --- Cache check ---
         if os.path.exists(fpath):
             print(f"       SKIP — already cached ({os.path.getsize(fpath):,} bytes)")
             results["cached"].append(fname)
             continue
 
-        # --- Year range guard ---
         if year < GOES_CONUS_MIN_YEAR:
             print(
                 f"       SKIP — year {year} is before GOES CONUS v4 coverage "
@@ -165,22 +186,19 @@ def main():
             results["skipped"].append(fname)
             continue
 
-        # --- API fetch ---
         print(f"       Fetching ({lat}, {lon}), year {year} ...")
         try:
             df = fetch_one(lat, lon, year)
-            df.to_csv(fpath)
+            df.write_csv(fpath)
             print(f"       OK — {len(df):,} rows saved to {fname}")
             results["fetched"].append(fname)
         except (ValueError, PermissionError, RuntimeError) as exc:
             print(f"       ERROR — {exc}")
             results["failed"].append(fname)
 
-        # Respect API rate limit between requests
         if i < len(TARGETS) - 1:
             time.sleep(REQUEST_DELAY_S)
 
-    # --- Summary ---
     print("\n" + "=" * 60)
     print("Summary")
     print("=" * 60)
@@ -193,16 +211,15 @@ def main():
     if results["failed"]:
         print(f"  Failed   ({len(results['failed'])}): {', '.join(results['failed'])}")
 
-    # Preview one of the fetched files
     fetched_paths = [
         os.path.join(OUT_DIR, f)
         for f in results["fetched"]
         if os.path.exists(os.path.join(OUT_DIR, f))
     ]
     if fetched_paths:
-        sample = pd.read_csv(fetched_paths[0], index_col=0, parse_dates=True)
+        sample = pl.read_csv(fetched_paths[0])
         print(f"\nPreview — {os.path.basename(fetched_paths[0])}:")
-        print(sample.head(5).to_string())
+        print(sample.head(5))
 
 
 if __name__ == "__main__":

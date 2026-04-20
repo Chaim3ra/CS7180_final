@@ -24,7 +24,7 @@ Parameters fetched:
 import os
 import time
 
-import pandas as pd
+import polars as pl
 import requests
 
 # ---------------------------------------------------------------------------
@@ -43,11 +43,8 @@ OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "raw")
 # Output filename: nasa_power_{name}_{year}.csv
 # ---------------------------------------------------------------------------
 TARGETS = [
-    # Austin, TX
     {"name": "austin",     "lat": 30.2672,  "lon": -97.7431,  "year": 2018},
-    # New York, NY
     {"name": "newyork",    "lat": 40.7128,  "lon": -74.0060,  "year": 2019},
-    # San Jose, CA — NASA POWER covers all years (unlike NSRDB GOES which starts 2018)
     {"name": "california", "lat": 37.3382,  "lon": -121.8863, "year": 2014},
     {"name": "california", "lat": 37.3382,  "lon": -121.8863, "year": 2015},
     {"name": "california", "lat": 37.3382,  "lon": -121.8863, "year": 2016},
@@ -60,60 +57,70 @@ TARGETS = [
 # Core fetch
 # ---------------------------------------------------------------------------
 
-def fetch_one(lat: float, lon: float, year: int) -> pd.DataFrame:
-    """
-    Fetch a full calendar year of hourly data from NASA POWER for one location.
+def fetch_one(lat: float, lon: float, year: int) -> pl.DataFrame:
+    """Fetch a full calendar year of hourly data from NASA POWER.
 
-    Returns a DataFrame with a DatetimeIndex (LST) and one column per parameter.
-    Missing-data fill values (-999.0) are replaced with NaN.
+    Args:
+        lat: Latitude of the target location.
+        lon: Longitude of the target location.
+        year: Calendar year to fetch.
+
+    Returns:
+        Polars DataFrame with a ``datetime`` column and one column per
+        parameter.  Missing-data fill values (``-999.0``) are replaced
+        with ``null``.
+
+    Raises:
+        RuntimeError: On non-200 HTTP status or API-level error messages.
     """
     params = {
         "latitude":      lat,
         "longitude":     lon,
         "start":         f"{year}0101",
         "end":           f"{year}1231",
-        "community":     "RE",          # Renewable Energy community
+        "community":     "RE",
         "parameters":    PARAMETERS,
         "format":        "JSON",
         "header":        "true",
-        "time-standard": "LST",         # local standard time
+        "time-standard": "LST",
     }
 
     response = requests.get(BASE_URL, params=params, timeout=120)
-
     if response.status_code != 200:
         raise RuntimeError(
             f"HTTP {response.status_code} — {response.text[:300]}"
         )
 
     payload = response.json()
-
-    # Check for API-level error messages
     messages = payload.get("messages", [])
     if messages:
         raise RuntimeError(f"API error: {messages}")
 
-    # Build DataFrame: each key in parameter dict becomes a column;
-    # index is the YYYYMMDDHH timestamp string.
+    # param_data: {"PARAM_NAME": {"YYYYMMDDHH": value, ...}, ...}
     param_data = payload["properties"]["parameter"]
-    df = pd.DataFrame(param_data)           # index = YYYYMMDDHH strings, cols = params
+    timestamps = list(next(iter(param_data.values())).keys())
 
-    # Parse YYYYMMDDHH → datetime
-    df.index = pd.to_datetime(df.index, format="%Y%m%d%H")
-    df.index.name = "datetime"
+    data = {param: list(vals.values()) for param, vals in param_data.items()}
+    df = pl.DataFrame(data).with_columns(
+        pl.Series("datetime", timestamps)
+        .str.to_datetime(format="%Y%m%d%H")
+    )
 
-    # Replace fill values with NaN
-    df.replace(FILL_VALUE, float("nan"), inplace=True)
+    # Replace fill values with null
+    data_cols = [c for c in df.columns if c != "datetime"]
+    df = df.with_columns([
+        pl.when(pl.col(c) == FILL_VALUE).then(None).otherwise(pl.col(c)).alias(c)
+        for c in data_cols
+    ])
 
-    # Rename columns to friendlier names
-    df.rename(columns={
+    df = df.rename({
         "ALLSKY_SFC_SW_DWN":  "GHI_W_m2",
         "ALLSKY_SFC_SW_DNI":  "DNI_W_m2",
         "ALLSKY_SFC_SW_DIFF": "DHI_W_m2",
         "T2M":                "Temp_C",
         "WS2M":               "WindSpeed_m_s",
         "RH2M":               "RelHumidity_pct",
-    }, inplace=True)
+    })
 
     return df
 
@@ -137,28 +144,24 @@ def main():
 
         print(f"\n[{i+1}/{len(TARGETS)}] {fname}")
 
-        # --- Cache check ---
         if os.path.exists(fpath):
             print(f"  SKIP — already cached ({os.path.getsize(fpath):,} bytes)")
             results["cached"].append(fname)
             continue
 
-        # --- API fetch ---
         print(f"  Fetching ({lat}, {lon}), year {year} ...")
         try:
             df = fetch_one(lat, lon, year)
-            df.to_csv(fpath)
-            print(f"  OK — {len(df):,} rows, {df.shape[1]} cols -> {fname}")
+            df.write_csv(fpath)
+            print(f"  OK — {len(df):,} rows, {df.width} cols -> {fname}")
             results["fetched"].append(fname)
         except Exception as exc:
             print(f"  ERROR — {exc}")
             results["failed"].append(fname)
 
-        # Polite delay between requests
         if i < len(TARGETS) - 1:
             time.sleep(REQUEST_DELAY_S)
 
-    # --- Summary ---
     print("\n" + "=" * 60)
     print("Summary")
     print("=" * 60)
@@ -169,16 +172,15 @@ def main():
     if results["failed"]:
         print(f"  Failed  ({len(results['failed'])}): {', '.join(results['failed'])}")
 
-    # Preview the first fetched file
     fetched_paths = [
         os.path.join(OUT_DIR, f)
         for f in results["fetched"]
         if os.path.exists(os.path.join(OUT_DIR, f))
     ]
     if fetched_paths:
-        sample = pd.read_csv(fetched_paths[0], index_col=0, parse_dates=True)
+        sample = pl.read_csv(fetched_paths[0])
         print(f"\nPreview — {os.path.basename(fetched_paths[0])}:")
-        print(sample.head(5).to_string())
+        print(sample.head(5))
 
 
 if __name__ == "__main__":

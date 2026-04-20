@@ -19,13 +19,13 @@ Requires in .env:
     PECAN_STREET_DB_PORT     — port from dataport.pecanstreet.org/access
     PECAN_STREET_DB_NAME     — database name from dataport.pecanstreet.org/access
 
-Install:  pip install psycopg2-binary python-dotenv pandas
+Install:  pip install psycopg2-binary python-dotenv polars
 """
 
 import os
 import sys
 
-import pandas as pd
+import polars as pl
 from dotenv import load_dotenv
 
 try:
@@ -107,9 +107,8 @@ def get_connection() -> "psycopg2.connection":
         sys.exit(f"ERROR: Database connection failed:\n  {exc}")
 
 
-def fetch_sample(conn) -> pd.DataFrame:
-    """
-    Pull 15-minute solar generation data from electricity.eg_realpower_15min.
+def fetch_sample(conn) -> pl.DataFrame:
+    """Pull 15-minute solar generation data from electricity.eg_realpower_15min.
 
     Schema (from official Pecan Street DataPort examples):
         electricity.eg_realpower_15min
@@ -119,10 +118,15 @@ def fetch_sample(conn) -> pd.DataFrame:
 
         other_datasets.metadata
             dataid, city, solar (not null = has solar panels), data availability
+
+    Args:
+        conn: Open psycopg2 database connection.
+
+    Returns:
+        Polars DataFrame with columns ``dataid``, ``local_15min``, ``solar``.
     """
     print(f"Finding up to {MAX_HOMES} Austin homes with solar data ...")
 
-    # Step 1: pick home IDs with solar panels and data in our window
     id_query = """
         SELECT dataid
         FROM other_datasets.metadata
@@ -145,7 +149,6 @@ def fetch_sample(conn) -> pd.DataFrame:
     dataids = [r["dataid"] for r in rows]
     print(f"  Home IDs: {dataids}")
 
-    # Step 2: pull the 15-minute solar generation for those homes
     print(f"Fetching 15-min solar data for {START_DATE} → {END_DATE} ...")
     data_query = """
         SELECT dataid, local_15min, solar
@@ -166,7 +169,7 @@ def fetch_sample(conn) -> pd.DataFrame:
     if not records:
         sys.exit("ERROR: Query returned 0 rows. Check date range or column names.")
 
-    return pd.DataFrame(records)
+    return pl.from_dicts([dict(r) for r in records])
 
 
 # ---------------------------------------------------------------------------
@@ -181,9 +184,9 @@ def main():
         conn.close()
 
     os.makedirs(OUT_DIR, exist_ok=True)
-    df.to_csv(OUT_PATH, index=False)
+    df.write_csv(OUT_PATH)
     print(f"\nSaved {len(df):,} rows to {OUT_PATH}")
-    print(df.head(10).to_string(index=False))
+    print(df.head(10))
 
 
 if __name__ == "__main__":

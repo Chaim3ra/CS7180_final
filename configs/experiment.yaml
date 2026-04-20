@@ -1,0 +1,66 @@
+model:
+  d_model: 128
+  nhead: 4
+  num_layers: 2
+  dropout: 0.1
+
+  encoders:
+    weather:
+      # GHI, DNI, DHI, temperature, wind_speed, humidity
+      input_dim: 6
+      ffn_dim: 256
+    generation:
+      # past kWh readings (univariate)
+      input_dim: 1
+      ffn_dim: 256
+    metadata:
+      # lat, lon, tilt_deg, azimuth_deg, capacity_kw, elevation_m
+      input_dim: 6
+      hidden_dim: 64
+
+  fusion:
+    # cross-attention heads (must divide d_model evenly)
+    nhead: 4
+
+  head:
+    hidden_dim: 128
+    # number of 15-min intervals to predict
+    forecast_horizon: 4
+
+data:
+  # paths relative to repo root; update once preprocessing is finalized
+  weather_path: data/raw/nsrdb_austin_2018.csv
+  generation_path: data/raw/pecanstreet_austin_1min_solar.csv
+  # column names in the respective CSVs
+  weather_cols: [GHI, DNI, DHI, Temperature, "Wind Speed", "Relative Humidity"]
+  generation_col: solar
+  # static site features: lat, lon, tilt_deg, azimuth_deg, capacity_kw, elevation_m
+  metadata: [30.2672, -97.7431, 20.0, 180.0, 5.0, 200.0]
+  # input context window (15-min intervals; 96 = 24 h)
+  seq_len: 96
+  forecast_horizon: 4
+  # fraction of rows used for train / val (remainder = test)
+  train_frac: 0.70
+  val_frac: 0.15
+  batch_size: 32
+  num_workers: 0
+
+training:
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  epochs: 50
+  # cosine | step | none
+  scheduler: cosine
+
+trainer:
+  max_epochs: 50
+  accelerator: auto
+  devices: 1
+  # 32-true (full float32) | 16-mixed (AMP) | bf16-mixed
+  precision: 32-true
+  log_every_n_steps: 10
+  val_check_interval: 1.0
+  gradient_clip_val: 1.0
+  enable_progress_bar: true
+  enable_model_summary: true
+  default_root_dir: logs/
