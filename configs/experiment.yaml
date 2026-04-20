@@ -29,10 +29,15 @@ model:
 
 data:
   # Preprocessed parquet files produced by src/preprocess.py
+  # Local files are used if present; otherwise streamed from S3 (set S3_BUCKET in .env).
   # Run: python src/preprocess.py   (skips if files exist; --force to reprocess)
   train_tx_parquet: data/processed/train_tx.parquet   # 19 TX homes, 2018
   train_ca_parquet: data/processed/train_ca.parquet   # 1 CA home (dataid 9836), 2014-2015
   test_ny_parquet:  data/processed/test_ny.parquet    # 14 NY homes, 2019 (zero-shot)
+
+  # S3 location of processed parquets (used when local files are absent)
+  s3_bucket: cs7180-final-project
+  s3_data_prefix: data/processed
 
   # Training split applied within TX+CA combined rows (NY is always held out)
   train_frac: 0.85    # 85% of TX+CA rows -> train

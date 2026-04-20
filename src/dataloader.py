@@ -7,6 +7,7 @@ aligned weather and generation time-series.
 
 from __future__ import annotations
 
+import io
 from pathlib import Path
 from typing import Optional, Union
 
@@ -19,7 +20,50 @@ try:
 except ImportError:
     import pytorch_lightning as L  # type: ignore[no-redef]
 
-__all__ = ["SolarWindowDataset", "SolarDataModule", "get_dataloader", "filter_solar_homes"]
+__all__ = [
+    "SolarWindowDataset",
+    "SolarDataModule",
+    "get_dataloader",
+    "filter_solar_homes",
+    "read_parquet",
+]
+
+
+def read_parquet(path: Union[str, Path]) -> pl.DataFrame:
+    """Read a parquet file from local disk or directly from S3.
+
+    If *path* starts with ``s3://``, the file is streamed from S3 via boto3
+    into an in-memory buffer — no local disk write is required.  Otherwise
+    the file is read from the local filesystem with Polars.
+
+    Args:
+        path: Local filesystem path or an S3 URI of the form
+            ``s3://bucket/key/to/file.parquet``.
+
+    Returns:
+        Polars DataFrame containing the parquet contents.
+
+    Raises:
+        ImportError: If ``boto3`` is not installed and an S3 URI is given.
+        FileNotFoundError: If a local path does not exist.
+    """
+    path = str(path)
+    if path.startswith("s3://"):
+        try:
+            import boto3
+        except ImportError as exc:
+            raise ImportError(
+                "boto3 is required for S3 streaming. Install it with: pip install boto3"
+            ) from exc
+        # s3://bucket/key/to/file.parquet  ->  bucket="bucket", key="key/to/file.parquet"
+        without_scheme = path[5:]
+        bucket, _, key = without_scheme.partition("/")
+        s3  = boto3.client("s3")
+        buf = io.BytesIO()
+        s3.download_fileobj(bucket, key, buf)
+        buf.seek(0)
+        return pl.read_parquet(buf)
+    return pl.read_parquet(path)
 
 
 def filter_solar_homes(
