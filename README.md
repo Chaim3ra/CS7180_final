@@ -81,20 +81,71 @@ persistence baseline (predict next hour = current hour).
 
 ---
 
+## Getting Started
+
+### Prerequisites
+
+- [conda](https://docs.conda.io/en/latest/miniconda.html) (Miniconda or Anaconda)
+- git
+- AWS credentials — shared privately by Nathan (needed for `dvc pull`)
+
+### 1. Clone and install
+
+```bash
+git clone https://github.com/Chaim3ra/CS7180_final
+cd CS7180_final
+conda create -n CS7180 python=3.11
+conda activate CS7180
+pip install -r requirements.txt
+pip install dvc dvc-s3
+```
+
+### 2. Configure AWS credentials (run once)
+
+```bash
+dvc remote modify --local s3remote access_key_id     YOUR_ACCESS_KEY
+dvc remote modify --local s3remote secret_access_key YOUR_SECRET_KEY
+```
+
+This writes to `.dvc/config.local`, which is gitignored and never committed.
+
+### 3. Pull all data from S3
+
+```bash
+dvc pull
+```
+
+Downloads ~3 GB of raw data to `data/raw/`.
+
+### 4. Validate setup
+
+```bash
+python src/validate.py
+```
+
+### 5. Run training
+
+```bash
+python src/train.py
+```
+
+---
+
 ## Repository Structure
 
 ```
 CS7180_final/
 ├── configs/
 │   └── experiment.yaml        # All hyperparameters and Trainer config
-├── data/raw/                  # Large CSVs (Git LFS tracked)
-│   ├── pecanstreet_*          # Generation data (1-min, 15-min)
-│   ├── nsrdb_*                # NREL NSRDB weather data
-│   └── nasa_power_*           # NASA POWER backup weather data
+├── data/
+│   ├── raw.dvc                # DVC pointer — actual CSVs stored in S3
+│   └── processed.dvc
 ├── docs/
 │   └── model_architecture.png # Architecture diagram
 ├── src/
 │   ├── dataloader.py          # Polars-backed SolarWindowDataset + LightningDataModule
+│   ├── train.py               # Training entry point
+│   ├── validate.py            # Setup validation script
 │   ├── fetch_pecanstreet.py   # Pecan Street Dataport fetch script
 │   ├── fetch_nsrdb.py         # NREL NSRDB fetch script
 │   ├── fetch_nasa_power.py    # NASA POWER fetch script
@@ -111,42 +162,6 @@ CS7180_final/
 │       └── heads/
 │           └── regression.py  # MLP regression head
 └── requirements.txt
-```
-
----
-
-## Setup
-
-```bash
-git clone https://github.com/Chaim3ra/CS7180_final
-cd CS7180_final
-conda create -n CS7180 python=3.11
-conda activate CS7180
-pip install -r requirements.txt
-pip install dvc-s3
-```
-
-Copy `.env.example` to `.env` and fill in your credentials:
-
-```bash
-cp .env.example .env
-# edit .env — required fields:
-#   NREL_API_KEY       — from developer.nrel.gov
-#   AWS_ACCESS_KEY_ID  — IAM key with s3:GetObject on cs7180-final-project
-#   AWS_SECRET_ACCESS_KEY
-```
-
-Configure DVC S3 credentials locally (never committed):
-
-```bash
-dvc remote modify --local s3remote access_key_id     <AWS_ACCESS_KEY_ID>
-dvc remote modify --local s3remote secret_access_key <AWS_SECRET_ACCESS_KEY>
-```
-
-Pull all data (~3 GB) from S3:
-
-```bash
-dvc pull
 ```
 
 ---
