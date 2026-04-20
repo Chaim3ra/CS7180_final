@@ -28,22 +28,51 @@ model:
     forecast_horizon: 4
 
 data:
-  # paths relative to repo root; update once preprocessing is finalized
-  weather_path: data/raw/nsrdb_austin_2018.csv
-  generation_path: data/raw/pecanstreet_austin_1min_solar.csv
-  # column names in the respective CSVs
-  weather_cols: [GHI, DNI, DHI, Temperature, "Wind Speed", "Relative Humidity"]
-  generation_col: solar
-  # static site features: lat, lon, tilt_deg, azimuth_deg, capacity_kw, elevation_m
-  metadata: [30.2672, -97.7431, 20.0, 180.0, 5.0, 200.0]
-  # input context window (15-min intervals; 96 = 24 h)
-  seq_len: 96
-  forecast_horizon: 4
-  # fraction of rows used for train / val (remainder = test)
-  train_frac: 0.70
-  val_frac: 0.15
+  # Preprocessed parquet files produced by src/preprocess.py
+  # Run: python src/preprocess.py   (skips if files exist; --force to reprocess)
+  train_tx_parquet: data/processed/train_tx.parquet   # 19 TX homes, 2018
+  train_ca_parquet: data/processed/train_ca.parquet   # 1 CA home (dataid 9836), 2014-2015
+  test_ny_parquet:  data/processed/test_ny.parquet    # 14 NY homes, 2019 (zero-shot)
+
+  # Training split applied within TX+CA combined rows (NY is always held out)
+  train_frac: 0.85    # 85% of TX+CA rows -> train
+  val_frac:   0.15    # 15% of TX+CA rows -> val
+
+  # Column names in the processed parquet files
+  weather_cols: [GHI_W_m2, DNI_W_m2, DHI_W_m2, Temp_C, WindSpeed_m_s, RelHumidity_pct]
+  solar_col: solar_kwh
+  metadata_cols: [lat, lon, tilt_deg, azimuth_deg, capacity_kw, elevation_m]
+
+  # Sliding-window parameters (15-min resolution)
+  seq_len: 96           # context window = 24 h
+  forecast_horizon: 4   # prediction horizon = 1 h
+
   batch_size: 32
   num_workers: 0
+
+  # Data provenance (informational)
+  regions:
+    tx:
+      homes: 19
+      year: 2018
+      source: Pecan Street Dataport (Austin)
+      weather: NASA POWER austin 2018
+      split: train
+    ca:
+      homes: 1          # dataid 9836 only; 3 others had all-zero solar (filtered)
+      years: [2014, 2015]
+      source: Pecan Street Dataport (San Diego)
+      weather: NASA POWER california 2014+2015
+      split: train
+      note: >
+        62 additional CA pv=yes homes exist in metadata but were absent from
+        the Dataport export. See data/README.md for details.
+    ny:
+      homes: 14
+      year: 2019
+      source: Pecan Street Dataport (New York)
+      weather: NASA POWER newyork 2019
+      split: test_zero_shot
 
 training:
   lr: 1.0e-4
