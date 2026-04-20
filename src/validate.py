@@ -11,7 +11,7 @@ import traceback
 from pathlib import Path
 from typing import Optional
 
-# ── Resolve repo root and load .env ──────────────────────────────────────────
+# -- Resolve repo root and load .env ------------------------------------------
 ROOT = Path(__file__).resolve().parent.parent
 
 env_path = ROOT / ".env"
@@ -24,6 +24,7 @@ if env_path.exists():
 
 _dr = os.environ.get("DATA_ROOT", "data/raw")
 DATA_ROOT = Path(_dr) if Path(_dr).is_absolute() else ROOT / _dr
+PROCESSED = ROOT / "data" / "processed"
 
 sys.path.insert(0, str(ROOT))
 
@@ -35,94 +36,60 @@ from torch.utils.data import DataLoader
 from src.models import build
 from src.dataloader import SolarWindowDataset
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# -- Constants ----------------------------------------------------------------
 SEQ_LEN          = 96
 FORECAST_HORIZON = 4
 BATCH            = 8
 N_WEATHER        = 6
 N_METADATA       = 6
 WEATHER_COLS     = ["GHI_W_m2", "DNI_W_m2", "DHI_W_m2", "Temp_C", "WindSpeed_m_s", "RelHumidity_pct"]
-
-# Representative metadata per region: lat, lon, tilt, azimuth, capacity_kw, elevation_m
-REGION_META = {
-    "tx": [30.2672, -97.7431, 20.0, 180.0, 5.0, 200.0],
-    "ca": [37.3382, -121.8863, 20.0, 180.0, 5.0, 30.0],
-    "ny": [40.7128, -74.0060,  20.0, 180.0, 5.0, 10.0],
-}
+SOLAR_COL        = "solar_kwh"
+METADATA_COLS    = ["lat", "lon", "tilt_deg", "azimuth_deg", "capacity_kw", "elevation_m"]
 
 RESULTS: dict[str, bool] = {}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# -- Helpers ------------------------------------------------------------------
 def banner(n: int, title: str) -> None:
     print(f"\n{'='*60}")
-    print(f"  CHECK {n} — {title}")
+    print(f"  CHECK {n} -- {title}")
     print(f"{'='*60}")
 
 
 def mark(name: str, passed: bool, msg: str = "") -> None:
     RESULTS[name] = passed
     tag = "PASS" if passed else "FAIL"
-    suffix = f" — {msg}" if msg else ""
+    suffix = f" -- {msg}" if msg else ""
     print(f"  [{tag}] {name}{suffix}")
 
 
-def homes_with_solar(df: pl.DataFrame) -> list[int]:
-    return (
-        df.filter(pl.col("solar").is_not_null())
-          .select("dataid").unique().sort("dataid")
-          ["dataid"].to_list()
-    )
+def make_dataset_from_parquet(df: pl.DataFrame, dataid: Optional[int] = None) -> SolarWindowDataset:
+    """Build a SolarWindowDataset from a processed parquet DataFrame.
 
-
-def align_weather_solar(
-    solar_df: pl.DataFrame,
-    weather_df: pl.DataFrame,
-    dataid: int,
-) -> Optional[pl.DataFrame]:
-    """Left-join hourly NASA-POWER weather to 15-min solar rows for one home.
-
-    Uses the first 13 chars of the timestamp string (YYYY-MM-DD HH) as the
-    join key so timezone offsets in the Pecan Street timestamps are ignored
-    without a full datetime parse.
+    Extracts weather, generation, and static metadata for a single home
+    (or the first home if dataid is None) without any CSV I/O.
     """
-    home = (
-        solar_df
-        .filter(pl.col("dataid") == dataid)
-        .select(["local_15min", "solar"])
-        .with_columns(
-            pl.col("local_15min").str.slice(0, 13).alias("ts_hour")
-        )
-    )
-    wx = (
-        weather_df
-        .with_columns(pl.col("datetime").str.slice(0, 13).alias("ts_hour"))
-        .select(["ts_hour"] + WEATHER_COLS)
-    )
-    joined = home.join(wx, on="ts_hour", how="left")
-    # Keep rows where solar and all weather cols are non-null
-    joined = joined.filter(pl.col("solar").is_not_null())
-    for col in WEATHER_COLS:
-        joined = joined.filter(pl.col(col).is_not_null())
-    return joined if joined.height >= SEQ_LEN + FORECAST_HORIZON else None
+    if dataid is not None:
+        df = df.filter(pl.col("dataid") == dataid)
+    meta_row = df.row(0, named=True)
+    metadata = [float(meta_row[c]) for c in METADATA_COLS]
 
-
-def make_dataset(aligned: pl.DataFrame, region: str) -> SolarWindowDataset:
-    wx  = aligned.select(WEATHER_COLS).to_numpy().astype(np.float32)
-    gen = aligned.select("solar").to_numpy().astype(np.float32)
+    wx  = df.select(WEATHER_COLS).to_numpy().astype(np.float32)
+    gen = df.select(SOLAR_COL).to_numpy().astype(np.float32)
     n   = min(len(wx), len(gen))
-    ds  = SolarWindowDataset.__new__(SolarWindowDataset)
+
+    ds = SolarWindowDataset.__new__(SolarWindowDataset)
     ds.weather          = torch.tensor(wx[:n],  dtype=torch.float32)
     ds.generation       = torch.tensor(gen[:n], dtype=torch.float32)
-    ds.metadata         = torch.tensor(REGION_META[region], dtype=torch.float32)
+    ds.metadata         = torch.tensor(metadata, dtype=torch.float32)
     ds.seq_len          = SEQ_LEN
     ds.forecast_horizon = FORECAST_HORIZON
     return ds
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CHECK 1 — DATA PIPELINE
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# CHECK 1 -- DATA PIPELINE (raw file existence)
+# =============================================================================
 banner(1, "DATA PIPELINE")
 
 FILES = [
@@ -136,7 +103,6 @@ FILES = [
 ]
 
 pipeline_ok = True
-loaded: dict[str, pl.DataFrame] = {}
 
 for label, fname, ts_col, key_col in FILES:
     path = DATA_ROOT / fname
@@ -153,88 +119,114 @@ for label, fname, ts_col, key_col in FILES:
             ts_range = f"  |  {vals[0]} .. {vals[-1]}"
         print(f"  {label:<12} shape={str(df.shape):<18} cols={len(df.columns):<5}"
               f"{null_info}{ts_range}")
-        loaded[label] = df
     except Exception as exc:
-        print(f"  {label}: ERROR — {exc}")
+        print(f"  {label}: ERROR -- {exc}")
         pipeline_ok = False
 
 mark("DATA PIPELINE", pipeline_ok,
      f"all {len(FILES)} files loaded" if pipeline_ok else "file load error")
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CHECK 2 — PREPROCESSING
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# CHECK 2 -- PREPROCESSING (validate processed parquets)
+# =============================================================================
 banner(2, "PREPROCESSING")
 
 preproc_ok = True
-aligned_data: dict[str, pl.DataFrame] = {}
+parquets: dict[str, pl.DataFrame] = {}
 
 try:
-    for region, solar_key, wx_key in [("tx", "TX solar", "TX weather"),
-                                       ("ca", "CA solar", "CA weather")]:
-        home_ids = homes_with_solar(loaded[solar_key])
-        assert home_ids, f"No homes with solar data in {solar_key}"
-        dataid = home_ids[0]
+    PARQUET_SPECS = [
+        ("TX", PROCESSED / "train_tx.parquet", 19, []),
+        ("CA", PROCESSED / "train_ca.parquet",  1, [9836]),
+        ("NY", PROCESSED / "test_ny.parquet",  14, []),
+    ]
 
-        aligned = align_weather_solar(loaded[solar_key], loaded[wx_key], dataid)
-        assert aligned is not None, (
-            f"{region.upper()} home {dataid}: alignment produced <{SEQ_LEN+FORECAST_HORIZON} rows"
+    for region, path, expected_n, expected_ids in PARQUET_SPECS:
+        assert path.exists(), f"{path.name} not found -- run: python src/preprocess.py"
+        df = pl.read_parquet(path)
+        parquets[region] = df
+
+        home_ids = sorted(df["dataid"].unique().to_list())
+        n_homes  = len(home_ids)
+
+        assert n_homes == expected_n, (
+            f"{region}: expected {expected_n} homes, got {n_homes}"
         )
+        if expected_ids:
+            assert home_ids == expected_ids, (
+                f"{region}: expected dataids {expected_ids}, got {home_ids}"
+            )
 
-        # Verify no nulls in required columns
-        for col in ["solar"] + WEATHER_COLS:
-            n_null = aligned[col].null_count()
-            assert n_null == 0, f"{col} has {n_null} nulls after alignment"
+        # No nulls in required columns
+        for col in [SOLAR_COL] + WEATHER_COLS:
+            n_null = df[col].null_count()
+            assert n_null == 0, f"{region} {col}: {n_null} nulls found"
 
-        print(f"  {region.upper()} home {dataid}:  {aligned.height} rows aligned")
-        print(f"    solar    : [{aligned['solar'].min():.4f}, {aligned['solar'].max():.4f}] kWh")
-        print(f"    GHI      : [{aligned['GHI_W_m2'].min():.1f}, {aligned['GHI_W_m2'].max():.1f}] W/m²")
-        print(f"    Temp     : [{aligned['Temp_C'].min():.1f}, {aligned['Temp_C'].max():.1f}] °C")
-        aligned_data[region] = aligned
+        # No all-zero solar homes (confirms quality filter ran correctly)
+        for hid in home_ids:
+            nonzero = df.filter((pl.col("dataid") == hid) & (pl.col(SOLAR_COL) > 0)).height
+            assert nonzero > 0, (
+                f"{region} dataid={hid}: all-zero solar present -- "
+                "filter_solar_homes should have removed this home"
+            )
 
-    mark("PREPROCESSING", True, "TX and CA aligned, zero nulls in solar/GHI/DNI/temperature")
+        solar_min = df[SOLAR_COL].min()
+        solar_max = df[SOLAR_COL].max()
+        ghi_min   = df["GHI_W_m2"].min()
+        ghi_max   = df["GHI_W_m2"].max()
+        print(f"  {region:<4}  {path.name:<26}  {df.height:>8,} rows  {n_homes} homes")
+        print(f"        dataids    : {home_ids}")
+        print(f"        solar_kwh  : [{solar_min:.4f}, {solar_max:.4f}]")
+        print(f"        GHI_W_m2   : [{ghi_min:.1f}, {ghi_max:.1f}]")
+
+    mark("PREPROCESSING", True,
+         "all 3 parquets valid; correct home counts; no nulls; no all-zero homes")
 except Exception as exc:
     mark("PREPROCESSING", False, str(exc))
     traceback.print_exc()
     preproc_ok = False
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CHECK 3 — WINDOWING
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# CHECK 3 -- WINDOWING (from processed TX parquet)
+# =============================================================================
 banner(3, "WINDOWING")
 
 try:
-    assert preproc_ok, "Skipped — preprocessing failed"
-    region = next(iter(aligned_data))
-    ds = make_dataset(aligned_data[region], region)
+    assert preproc_ok, "Skipped -- preprocessing check failed"
+
+    tx_df      = parquets["TX"]
+    first_home = sorted(tx_df["dataid"].unique().to_list())[0]
+    ds = make_dataset_from_parquet(tx_df, dataid=first_home)
     assert len(ds) > 0, f"Dataset empty (n_rows={ds.weather.shape[0]})"
 
     loader = DataLoader(ds, batch_size=BATCH, shuffle=False)
     weather_b, gen_b, meta_b, target_b = next(iter(loader))
     B = weather_b.shape[0]
 
-    print(f"  Dataset length : {len(ds)} windows")
+    print(f"  Source     : TX parquet, dataid={first_home}")
+    print(f"  Dataset    : {len(ds)} windows")
     print(f"  weather    : {tuple(weather_b.shape)}   expected ({B}, {SEQ_LEN}, {N_WEATHER})")
     print(f"  generation : {tuple(gen_b.shape)}   expected ({B}, {SEQ_LEN}, 1)")
     print(f"  metadata   : {tuple(meta_b.shape)}     expected ({B}, {N_METADATA})")
     print(f"  target     : {tuple(target_b.shape)}     expected ({B}, {FORECAST_HORIZON})")
 
-    assert weather_b.shape == (B, SEQ_LEN, N_WEATHER),   f"weather {weather_b.shape}"
-    assert gen_b.shape     == (B, SEQ_LEN, 1),            f"generation {gen_b.shape}"
-    assert meta_b.shape    == (B, N_METADATA),             f"metadata {meta_b.shape}"
-    assert target_b.shape  == (B, FORECAST_HORIZON),       f"target {target_b.shape}"
+    assert weather_b.shape == (B, SEQ_LEN, N_WEATHER), f"weather {weather_b.shape}"
+    assert gen_b.shape     == (B, SEQ_LEN, 1),          f"generation {gen_b.shape}"
+    assert meta_b.shape    == (B, N_METADATA),           f"metadata {meta_b.shape}"
+    assert target_b.shape  == (B, FORECAST_HORIZON),     f"target {target_b.shape}"
 
-    mark("WINDOWING", True, f"all shapes correct, {len(ds)} windows from {region.upper()} home")
+    mark("WINDOWING", True,
+         f"all shapes correct, {len(ds)} windows from TX dataid={first_home}")
 except Exception as exc:
     mark("WINDOWING", False, str(exc))
     traceback.print_exc()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CHECK 4 — MODEL FORWARD PASS
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# CHECK 4 -- MODEL FORWARD PASS
+# =============================================================================
 banner(4, "MODEL FORWARD PASS")
 
 model = None
@@ -243,9 +235,9 @@ try:
     model.eval()
     n_params = sum(p.numel() for p in model.parameters())
 
-    w  = torch.randn(BATCH, SEQ_LEN, N_WEATHER)
-    g  = torch.randn(BATCH, SEQ_LEN, 1)
-    m  = torch.randn(BATCH, N_METADATA)
+    w = torch.randn(BATCH, SEQ_LEN, N_WEATHER)
+    g = torch.randn(BATCH, SEQ_LEN, 1)
+    m = torch.randn(BATCH, N_METADATA)
 
     with torch.no_grad():
         out = model(w, g, m)
@@ -265,54 +257,54 @@ except Exception as exc:
     traceback.print_exc()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CHECK 5 — TRAIN/TEST SPLIT
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# CHECK 5 -- TRAIN/TEST SPLIT (from processed parquets)
+# =============================================================================
 banner(5, "TRAIN/TEST SPLIT")
 
 try:
-    tx_homes = set(homes_with_solar(loaded["TX solar"]))
-    ca_homes = set(homes_with_solar(loaded["CA solar"]))
-    ny_homes = set(homes_with_solar(loaded["NY solar"]))
+    assert preproc_ok, "Skipped -- preprocessing check failed"
 
-    train_homes = tx_homes | ca_homes
-    overlap     = train_homes & ny_homes
+    tx_ids = set(parquets["TX"]["dataid"].unique().to_list())
+    ca_ids = set(parquets["CA"]["dataid"].unique().to_list())
+    ny_ids = set(parquets["NY"]["dataid"].unique().to_list())
 
-    print(f"  TX train homes ({len(tx_homes)}) : {sorted(tx_homes)}")
-    print(f"  CA train homes ({len(ca_homes)}) : {sorted(ca_homes)}")
-    print(f"  NY test  homes ({len(ny_homes)}) : {sorted(ny_homes)}")
-    print(f"  Train & Test overlap       : {overlap if overlap else 'empty (no overlap)'}")
+    train_ids = tx_ids | ca_ids
+    overlap   = train_ids & ny_ids
 
-    assert len(train_homes) > 0, "No train homes found"
-    assert len(ny_homes)    > 0, "No NY test homes found"
-    assert len(overlap) == 0,    f"Train/test overlap: {overlap}"
+    print(f"  TX train ({len(tx_ids)} homes)  : {sorted(tx_ids)}")
+    print(f"  CA train ({len(ca_ids)} home)    : {sorted(ca_ids)}")
+    print(f"  NY test  ({len(ny_ids)} homes) : {sorted(ny_ids)}")
+    print(f"  Train/test overlap : {overlap if overlap else 'empty (no overlap)'}")
+
+    assert len(tx_ids) == 19,         f"TX: expected 19 homes, got {len(tx_ids)}"
+    assert len(ca_ids) ==  1,         f"CA: expected 1 home, got {len(ca_ids)}"
+    assert sorted(ca_ids) == [9836],  f"CA: expected [9836], got {sorted(ca_ids)}"
+    assert len(ny_ids) == 14,         f"NY: expected 14 homes, got {len(ny_ids)}"
+    assert len(overlap) == 0,         f"Train/test overlap: {overlap}"
 
     mark("TRAIN/TEST SPLIT", True,
-         f"train={len(train_homes)} (TX+CA), test={len(ny_homes)} (NY), overlap=0")
+         "TX=19 + CA=1 train, NY=14 test, overlap=0")
 except Exception as exc:
     mark("TRAIN/TEST SPLIT", False, str(exc))
     traceback.print_exc()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
-# CHECK 6 — NY TRANSFER (zero-shot forward pass)
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
+# CHECK 6 -- NY TRANSFER (from processed test parquet)
+# =============================================================================
 banner(6, "NY TRANSFER CHECK")
 
 try:
-    assert model is not None, "Model unavailable — check 4 failed"
+    assert model is not None, "Model unavailable -- check 4 failed"
+    assert preproc_ok, "Skipped -- preprocessing check failed"
 
-    ny_home_ids = homes_with_solar(loaded["NY solar"])
-    assert ny_home_ids, "No NY homes with solar data"
-    ny_dataid = ny_home_ids[0]
+    ny_df       = parquets["NY"]
+    ny_home_ids = sorted(ny_df["dataid"].unique().to_list())
+    ny_dataid   = ny_home_ids[0]
 
-    ny_aligned = align_weather_solar(loaded["NY solar"], loaded["NY weather"], ny_dataid)
-    assert ny_aligned is not None, (
-        f"NY home {ny_dataid}: alignment produced <{SEQ_LEN+FORECAST_HORIZON} rows"
-    )
-
-    ds_ny = make_dataset(ny_aligned, "ny")
-    assert len(ds_ny) > 0, "NY dataset empty after alignment"
+    ds_ny = make_dataset_from_parquet(ny_df, dataid=ny_dataid)
+    assert len(ds_ny) > 0, f"NY dataid={ny_dataid}: dataset empty after windowing"
 
     loader_ny = DataLoader(ds_ny, batch_size=BATCH, shuffle=False)
     wx_b, gen_b, meta_b, _ = next(iter(loader_ny))
@@ -325,7 +317,8 @@ try:
     expected_B = min(BATCH, len(ds_ny))
     assert preds.shape == (expected_B, FORECAST_HORIZON), f"shape {preds.shape}"
 
-    print(f"  NY home      : {ny_dataid}  ({ny_aligned.height} aligned rows, {len(ds_ny)} windows)")
+    home_rows = ny_df.filter(pl.col("dataid") == ny_dataid).height
+    print(f"  NY home      : {ny_dataid}  ({home_rows} rows, {len(ds_ny)} windows)")
     print(f"  Output shape : {tuple(preds.shape)}")
     print(f"  Sample predictions (kWh per 15-min step, untrained model):")
     for i, row in enumerate(preds[:3].tolist()):
@@ -339,9 +332,9 @@ except Exception as exc:
     traceback.print_exc()
 
 
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 # SUMMARY
-# ═════════════════════════════════════════════════════════════════════════════
+# =============================================================================
 print(f"\n{'='*60}")
 print("  SUMMARY")
 print(f"{'='*60}")

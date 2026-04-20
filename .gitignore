@@ -30,10 +30,12 @@ env/
 # PVDAQ per-system JSON cache (1800+ small files; auto-rebuilt by fetch_pvdaq.py)
 data/raw/pvdaq_system_jsons/
 
-# Model checkpoints
+# Model checkpoints and training logs
 models/*.pt
 models/*.pth
 models/*.ckpt
+models/checkpoints/
+logs/
 
 # OS
 .DS_Store

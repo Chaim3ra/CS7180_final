@@ -42,7 +42,7 @@ import numpy as np
 import polars as pl
 import torch
 import yaml
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 try:
     import lightning as L
@@ -104,6 +104,17 @@ def _resolve_parquet(local_rel: str, cfg: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _cap(dataset, max_windows):
+    """Return a Subset of the first max_windows samples, or the full dataset if None."""
+    if max_windows is None or len(dataset) <= max_windows:
+        return dataset
+    return Subset(dataset, list(range(max_windows)))
+
+
+# ---------------------------------------------------------------------------
 # Per-home dataset builder
 # ---------------------------------------------------------------------------
 
@@ -144,7 +155,7 @@ class MultiHomeDataModule(L.LightningDataModule):
     - Test:      NY parquet — all rows per home (zero-shot).
     """
 
-    def __init__(self, cfg: dict):
+    def __init__(self, cfg: dict, fast: bool = False):
         super().__init__()
         d = cfg["data"]
         # Resolve each parquet: local path if it exists, S3 URI otherwise.
@@ -156,10 +167,14 @@ class MultiHomeDataModule(L.LightningDataModule):
         self.train_frac       = d["train_frac"]
         self.batch_size       = d["batch_size"]
         self.num_workers      = d["num_workers"]
+        # In fast mode cap windows so CPU smoke-test finishes in seconds.
+        self.fast_train_cap = 2_000 if fast else None
+        self.fast_val_cap   =   500 if fast else None
+        self.fast_test_cap  =   500 if fast else None
 
-        self._train_ds: Optional[ConcatDataset] = None
-        self._val_ds:   Optional[ConcatDataset] = None
-        self._test_ds:  Optional[ConcatDataset] = None
+        self._train_ds = None
+        self._val_ds   = None
+        self._test_ds  = None
 
     def setup(self, stage: Optional[str] = None) -> None:
         # read_parquet handles both local paths and s3:// URIs transparently
@@ -188,21 +203,28 @@ class MultiHomeDataModule(L.LightningDataModule):
             if len(ds) > 0:
                 test_sets.append(ds)
 
-        self._train_ds = ConcatDataset(train_sets)
-        self._val_ds   = ConcatDataset(val_sets)
-        self._test_ds  = ConcatDataset(test_sets)
+        full_train = ConcatDataset(train_sets)
+        full_val   = ConcatDataset(val_sets)
+        full_test  = ConcatDataset(test_sets)
+
+        self._train_ds = _cap(full_train, self.fast_train_cap)
+        self._val_ds   = _cap(full_val,   self.fast_val_cap)
+        self._test_ds  = _cap(full_test,  self.fast_test_cap)
 
     def train_dataloader(self) -> DataLoader:
+        pin = torch.cuda.is_available()
         return DataLoader(self._train_ds, batch_size=self.batch_size,
-                          shuffle=True,  num_workers=self.num_workers, pin_memory=True)
+                          shuffle=True,  num_workers=self.num_workers, pin_memory=pin)
 
     def val_dataloader(self) -> DataLoader:
+        pin = torch.cuda.is_available()
         return DataLoader(self._val_ds, batch_size=self.batch_size,
-                          shuffle=False, num_workers=self.num_workers, pin_memory=True)
+                          shuffle=False, num_workers=self.num_workers, pin_memory=pin)
 
     def test_dataloader(self) -> DataLoader:
+        pin = torch.cuda.is_available()
         return DataLoader(self._test_ds, batch_size=self.batch_size,
-                          shuffle=False, num_workers=self.num_workers, pin_memory=True)
+                          shuffle=False, num_workers=self.num_workers, pin_memory=pin)
 
 
 # ---------------------------------------------------------------------------
@@ -215,16 +237,17 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
         cfg = yaml.safe_load(f)
 
     # -- Data -----------------------------------------------------------------
-    dm = MultiHomeDataModule(cfg)
+    dm = MultiHomeDataModule(cfg, fast=fast)
     dm.setup()
 
     print(f"\n{'='*60}")
     print("  TRAINING RUN")
     print(f"{'='*60}")
     print(f"  Config           : {config_path.relative_to(ROOT)}")
-    print(f"  Train windows    (TX+CA 85%) : {len(dm._train_ds):>8,}")
-    print(f"  Val   windows    (TX+CA 15%) : {len(dm._val_ds):>8,}")
-    print(f"  Test  windows    (NY  100%)  : {len(dm._test_ds):>8,}")
+    fast_tag = " [capped]" if fast else ""
+    print(f"  Train windows    (TX+CA 85%) : {len(dm._train_ds):>8,}{fast_tag}")
+    print(f"  Val   windows    (TX+CA 15%) : {len(dm._val_ds):>8,}{fast_tag}")
+    print(f"  Test  windows    (NY  100%)  : {len(dm._test_ds):>8,}{fast_tag}")
 
     # -- Model ----------------------------------------------------------------
     model = build(config_path)
@@ -249,7 +272,7 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
     t = cfg["trainer"]
     max_epochs = 5 if fast else t["max_epochs"]
     if fast:
-        print(f"  [FAST MODE] max_epochs overridden -> 5")
+        print(f"  [FAST MODE] max_epochs=5, train cap=2000, val cap=500, test cap=500")
 
     trainer = L.Trainer(
         max_epochs=max_epochs,

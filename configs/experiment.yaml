@@ -53,7 +53,8 @@ data:
   forecast_horizon: 4   # prediction horizon = 1 h
 
   batch_size: 32
-  num_workers: 0
+  # Set to 0 on CPU-only machines; 7+ recommended for multi-core GPU machines
+  num_workers: 7
 
   # Data provenance (informational)
   regions:
