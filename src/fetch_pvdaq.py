@@ -27,9 +27,11 @@ Usage:
 No API key required — the OEDI bucket is public.
 """
 
+import concurrent.futures
 import io
 import json
 import os
+import re
 
 import boto3
 import pandas as pd
@@ -50,6 +52,12 @@ LEGACY_PATH     = os.path.join(OUT_DIR, "pvdaq_systems_metadata.csv")
 RICH_PATH       = os.path.join(OUT_DIR, "pvdaq_systems_rich_metadata.csv")
 JSON_DIR        = os.path.join(OUT_DIR, "pvdaq_system_jsons")
 CANDIDATE_PATH  = os.path.join(OUT_DIR, "pvdaq_candidate_systems.csv")
+SELECTED_PATH   = os.path.join(OUT_DIR, "pvdaq_selected_50.csv")
+
+PVDATA_PREFIX   = "pvdaq/csv/pvdata/"
+MAX_SIZE_MB     = 30.0    # skip systems whose best year exceeds this threshold
+TARGET_COUNT    = 50      # number of systems to select
+GRID_RES        = 0.1     # degrees — cell size for geographic diversity grid
 
 # Continental US bounding box (excludes Hawaii, Alaska, Puerto Rico, etc.)
 CONUS_LAT = (24.0, 50.0)
@@ -487,6 +495,232 @@ def print_and_save_candidates(df_cand: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 6: Probe S3 for sensor-candidate systems and select top 50
+# ---------------------------------------------------------------------------
+
+# Regex for annual corrected file:  {sid}_ac_{YYYY}0101_{YYYY}1231_corrected.csv
+_ANNUAL_RE = re.compile(r"_ac_(\d{4})0101_(\d{4})1231_corrected\.csv$")
+# Regex for NREL daily file:        system_{sid}__date_{YYYY}_{MM}_{DD}.csv
+_DAILY_RE  = re.compile(r"__date_(\d{4})_\d{2}_\d{2}\.csv$")
+
+
+def _make_client():
+    """Create a new unsigned S3 client. Must be called per-thread."""
+    client = boto3.client("s3", region_name="us-west-2")
+    client.meta.events.register("choose-signer.s3.*", disable_signing)
+    return client
+
+
+def probe_system_s3(sid: int) -> dict:
+    """
+    List S3 objects under pvdaq/csv/pvdata/system_id={sid}/ and determine
+    the best downloadable year.
+
+    Returns a dict with keys:
+        system_id, has_data, file_format, best_year, size_mb, n_files, error
+    """
+    client  = _make_client()
+    prefix  = f"{PVDATA_PREFIX}system_id={sid}/"
+    base    = {"system_id": sid, "has_data": False, "file_format": None,
+               "best_year": None, "size_mb": None, "n_files": 0, "error": None}
+
+    try:
+        paginator = client.get_paginator("list_objects_v2")
+        pages = paginator.paginate(Bucket=BUCKET_NAME, Prefix=prefix)
+
+        all_objects = []
+        for page in pages:
+            for obj in page.get("Contents", []):
+                all_objects.append((obj["Key"], obj["Size"]))
+    except Exception as exc:
+        return {**base, "error": str(exc)}
+
+    if not all_objects:
+        return {**base, "error": "no files in prefix"}
+
+    base["n_files"] = len(all_objects)
+
+    # ----- Detect annual corrected files -----
+    annual_years: dict[int, tuple[str, int]] = {}  # year -> (key, size_bytes)
+    daily_year_bytes: dict[int, int] = {}           # year -> cumulative bytes
+
+    for key, size in all_objects:
+        fname = key.rsplit("/", 1)[-1]
+
+        m_ann = _ANNUAL_RE.search(fname)
+        if m_ann and m_ann.group(1) == m_ann.group(2):  # start_year == end_year
+            year = int(m_ann.group(1))
+            annual_years[year] = (key, size)
+            continue
+
+        m_day = _DAILY_RE.search(fname)
+        if m_day:
+            year = int(m_day.group(1))
+            daily_year_bytes[year] = daily_year_bytes.get(year, 0) + size
+
+    if annual_years:
+        best_year = max(annual_years)
+        best_key, best_bytes = annual_years[best_year]
+        return {
+            **base,
+            "has_data":    True,
+            "file_format": "annual",
+            "best_year":   best_year,
+            "size_mb":     round(best_bytes / 1_048_576, 2),
+        }
+
+    if daily_year_bytes:
+        best_year = max(daily_year_bytes, key=daily_year_bytes.get)
+        total_mb  = daily_year_bytes[best_year] / 1_048_576
+        return {
+            **base,
+            "has_data":    True,
+            "file_format": "daily",
+            "best_year":   best_year,
+            "size_mb":     round(total_mb, 2),
+        }
+
+    return {**base, "error": "no annual or daily files matched"}
+
+
+def build_s3_inventory(df_cand: pd.DataFrame, max_workers: int = 20) -> pd.DataFrame:
+    """
+    Probe S3 for every sensor candidate system using a thread pool.
+    Returns a DataFrame with one row per system.
+    """
+    sensor_sids = df_cand.loc[df_cand["has_weather_sensors"], "system_id"].tolist()
+    n = len(sensor_sids)
+    print(f"\n[6] Probing S3 inventory for {n} sensor-candidate systems ...")
+
+    results: list[dict] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_map = {pool.submit(probe_system_s3, sid): sid for sid in sensor_sids}
+        for i, fut in enumerate(concurrent.futures.as_completed(future_map), 1):
+            results.append(fut.result())
+            if i % 25 == 0 or i == n:
+                within = sum(
+                    1 for r in results
+                    if r.get("has_data") and (r.get("size_mb") or 0) <= MAX_SIZE_MB
+                )
+                print(f"    {i}/{n} probed — {within} viable so far")
+
+    df_inv = pd.DataFrame(results)
+    # Attach lat/lon/state/years from candidates for the selection step
+    meta = df_cand[["system_id", "state", "latitude", "longitude",
+                    "years", "dc_capacity_kW"]].copy()
+    df_inv = df_inv.merge(meta, on="system_id", how="left")
+    return df_inv
+
+
+def select_top_50(df_inv: pd.DataFrame) -> pd.DataFrame:
+    """
+    Select up to TARGET_COUNT systems from the S3 inventory that:
+      - have at least one viable file (has_data=True)
+      - have estimated year size <= MAX_SIZE_MB
+
+    Selection prioritises geographic diversity using a GRID_RES-degree
+    lat/lon grid, then fills remaining slots with the best remaining systems
+    (sorted by years desc, most recent year desc, size asc).
+    """
+    # Viable: has data and within storage budget
+    viable = df_inv[
+        df_inv["has_data"].fillna(False)
+        & (df_inv["size_mb"].fillna(float("inf")) <= MAX_SIZE_MB)
+    ].copy()
+
+    if viable.empty:
+        print("  WARNING: no viable systems within size budget.")
+        return viable
+
+    # Assign grid cell
+    viable["grid_lat"] = (viable["latitude"] / GRID_RES).round(0) * GRID_RES
+    viable["grid_lon"] = (viable["longitude"] / GRID_RES).round(0) * GRID_RES
+    viable["grid_cell"] = (
+        viable["grid_lat"].map(lambda x: f"{x:.1f}")
+        + "_"
+        + viable["grid_lon"].map(lambda x: f"{x:.1f}")
+    )
+
+    # Sort: most years first, most recent best_year first, smallest file first
+    viable = viable.sort_values(
+        ["years", "best_year", "size_mb"],
+        ascending=[False, False, True],
+    ).reset_index(drop=True)
+
+    selected_rows: list[pd.Series] = []
+    used_cells:    set[str]        = set()
+    used_ids:      set[int]        = set()
+
+    # Pass 1 — one representative per grid cell
+    for _, row in viable.iterrows():
+        if len(selected_rows) >= TARGET_COUNT:
+            break
+        cell = row["grid_cell"]
+        if cell not in used_cells:
+            selected_rows.append(row)
+            used_cells.add(cell)
+            used_ids.add(row["system_id"])
+
+    # Pass 2 — fill remaining slots with best leftover systems
+    if len(selected_rows) < TARGET_COUNT:
+        for _, row in viable.iterrows():
+            if len(selected_rows) >= TARGET_COUNT:
+                break
+            if row["system_id"] not in used_ids:
+                selected_rows.append(row)
+                used_ids.add(row["system_id"])
+
+    df_50 = pd.DataFrame(selected_rows).reset_index(drop=True)
+    return df_50
+
+
+def print_and_save_selected(df_50: pd.DataFrame) -> None:
+    """Print the selected-50 list and save it to SELECTED_PATH."""
+    print_separator("SELECTED 50 SYSTEMS")
+    print(f"Systems selected: {len(df_50)}")
+
+    # State breakdown
+    state_counts = (
+        df_50["state"].value_counts(dropna=False)
+        .rename_axis("state").reset_index(name="count")
+    )
+    print(f"\nStates represented ({state_counts['state'].nunique()}):")
+    print(state_counts.to_string(index=False))
+
+    # Format breakdown
+    if "file_format" in df_50.columns:
+        fmt_counts = df_50["file_format"].value_counts()
+        print(f"\nFile format: {dict(fmt_counts)}")
+
+    # Size summary
+    if "size_mb" in df_50.columns:
+        mb = df_50["size_mb"].dropna()
+        print(f"Year file size (MB): min={mb.min():.2f}, "
+              f"median={mb.median():.2f}, max={mb.max():.2f}, "
+              f"total={mb.sum():.1f}")
+
+    # Full table
+    display_cols = [c for c in [
+        "system_id", "state", "latitude", "longitude",
+        "dc_capacity_kW", "years", "file_format", "best_year", "size_mb",
+    ] if c in df_50.columns]
+
+    print(f"\nFull list (geographic diversity order):")
+    pd.set_option("display.max_rows", None)
+    pd.set_option("display.width", 140)
+    pd.set_option("display.float_format", "{:.3f}".format)
+    print(df_50[display_cols].to_string(index=True))
+    pd.reset_option("display.max_rows")
+    pd.reset_option("display.float_format")
+
+    # Save
+    save_cols = [c for c in df_50.columns if c not in ("grid_lat", "grid_lon", "grid_cell")]
+    df_50[save_cols].to_csv(SELECTED_PATH, index=False)
+    print(f"\nSaved {len(df_50)} systems -> {SELECTED_PATH}")
+    print_separator()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -502,6 +736,18 @@ def main():
 
     df_cand = filter_candidates(df_rich, df_sensors)
     print_and_save_candidates(df_cand)
+
+    # ----------------------------------------------------------------
+    # Step 6: Select top 50 systems with geographic diversity
+    # ----------------------------------------------------------------
+    if os.path.exists(SELECTED_PATH):
+        print(f"\n[6] Cache hit -> {SELECTED_PATH}")
+        df_selected = pd.read_csv(SELECTED_PATH)
+    else:
+        df_inv      = build_s3_inventory(df_cand)
+        df_selected = select_top_50(df_inv)
+
+    print_and_save_selected(df_selected)
 
 
 if __name__ == "__main__":
