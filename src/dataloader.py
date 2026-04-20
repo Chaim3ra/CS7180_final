@@ -19,7 +19,41 @@ try:
 except ImportError:
     import pytorch_lightning as L  # type: ignore[no-redef]
 
-__all__ = ["SolarWindowDataset", "SolarDataModule", "get_dataloader"]
+__all__ = ["SolarWindowDataset", "SolarDataModule", "get_dataloader", "filter_solar_homes"]
+
+
+def filter_solar_homes(
+    df: pl.DataFrame,
+    solar_col: str = "solar_kwh",
+    min_nonzero_frac: float = 0.05,
+) -> list[int]:
+    """Return home IDs that have sufficient non-zero solar generation.
+
+    Homes where the solar column is all zeros or has fewer than
+    ``min_nonzero_frac`` non-zero rows are excluded from training.
+    Prints a summary line for every filtered home.
+
+    Args:
+        df: DataFrame containing ``dataid`` and ``solar_col`` columns.
+        solar_col: Name of the solar generation column.
+        min_nonzero_frac: Minimum fraction of non-zero rows required.
+
+    Returns:
+        Sorted list of dataid integers that pass the filter.
+    """
+    valid: list[int] = []
+    home_ids = df["dataid"].unique().sort().to_list()
+    for dataid in home_ids:
+        home = df.filter(pl.col("dataid") == dataid)
+        total   = home.height
+        nonzero = home.filter(pl.col(solar_col) > 0).height
+        frac    = nonzero / total if total > 0 else 0.0
+        if frac < min_nonzero_frac:
+            reason = "all zeros" if nonzero == 0 else f"{frac:.1%} non-zero < {min_nonzero_frac:.0%}"
+            print(f"  [FILTERED] dataid={dataid:>5}  {reason}  ({nonzero}/{total} rows)")
+        else:
+            valid.append(dataid)
+    return valid
 
 
 class SolarWindowDataset(Dataset):
