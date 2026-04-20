@@ -89,10 +89,12 @@ training:
 
 trainer:
   max_epochs: 50
-  accelerator: auto
-  devices: 1
-  # 32-true (full float32) | 16-mixed (AMP) | bf16-mixed
-  precision: 32-true
+  accelerator: "auto"
+  devices: "auto"
+  # 32-true (full float32) | 16-mixed (AMP, overridden at runtime when CUDA detected)
+  precision: "32-true"
+  pin_memory: false          # overridden to true at runtime when CUDA detected
+  early_stopping_patience: 10
   log_every_n_steps: 10
   val_check_interval: 1.0
   gradient_clip_val: 1.0

@@ -46,12 +46,12 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset
 
 try:
     import lightning as L
-    from lightning.pytorch.callbacks import ModelCheckpoint
+    from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
     from lightning.pytorch.loggers import CSVLogger
 except ImportError:
     import pytorch_lightning as L  # type: ignore[no-redef]
-    from pytorch_lightning.callbacks import ModelCheckpoint  # type: ignore[no-redef]
-    from pytorch_lightning.loggers import CSVLogger          # type: ignore[no-redef]
+    from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint  # type: ignore[no-redef]
+    from pytorch_lightning.loggers import CSVLogger                          # type: ignore[no-redef]
 
 from src.models import build
 from src.dataloader import SolarWindowDataset, read_parquet
@@ -59,6 +59,15 @@ from src.dataloader import SolarWindowDataset, read_parquet
 WEATHER_COLS  = ["GHI_W_m2", "DNI_W_m2", "DHI_W_m2", "Temp_C", "WindSpeed_m_s", "RelHumidity_pct"]
 SOLAR_COL     = "solar_kwh"
 METADATA_COLS = ["lat", "lon", "tilt_deg", "azimuth_deg", "capacity_kw", "elevation_m"]
+
+
+class VerboseEarlyStopping(EarlyStopping):
+    """EarlyStopping that prints a message when it fires."""
+
+    def on_validation_end(self, trainer, pl_module) -> None:
+        super().on_validation_end(trainer, pl_module)
+        if trainer.should_stop:
+            print(f"\n  Early stopping triggered at epoch {trainer.current_epoch}")
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +164,7 @@ class MultiHomeDataModule(L.LightningDataModule):
     - Test:      NY parquet — all rows per home (zero-shot).
     """
 
-    def __init__(self, cfg: dict, fast: bool = False):
+    def __init__(self, cfg: dict, fast: bool = False, pin_memory: bool = False):
         super().__init__()
         d = cfg["data"]
         # Resolve each parquet: local path if it exists, S3 URI otherwise.
@@ -167,6 +176,7 @@ class MultiHomeDataModule(L.LightningDataModule):
         self.train_frac       = d["train_frac"]
         self.batch_size       = d["batch_size"]
         self.num_workers      = d["num_workers"]
+        self.pin_memory       = pin_memory
         # In fast mode cap windows so CPU smoke-test finishes in seconds.
         self.fast_train_cap = 2_000 if fast else None
         self.fast_val_cap   =   500 if fast else None
@@ -212,19 +222,16 @@ class MultiHomeDataModule(L.LightningDataModule):
         self._test_ds  = _cap(full_test,  self.fast_test_cap)
 
     def train_dataloader(self) -> DataLoader:
-        pin = torch.cuda.is_available()
         return DataLoader(self._train_ds, batch_size=self.batch_size,
-                          shuffle=True,  num_workers=self.num_workers, pin_memory=pin)
+                          shuffle=True,  num_workers=self.num_workers, pin_memory=self.pin_memory)
 
     def val_dataloader(self) -> DataLoader:
-        pin = torch.cuda.is_available()
         return DataLoader(self._val_ds, batch_size=self.batch_size,
-                          shuffle=False, num_workers=self.num_workers, pin_memory=pin)
+                          shuffle=False, num_workers=self.num_workers, pin_memory=self.pin_memory)
 
     def test_dataloader(self) -> DataLoader:
-        pin = torch.cuda.is_available()
         return DataLoader(self._test_ds, batch_size=self.batch_size,
-                          shuffle=False, num_workers=self.num_workers, pin_memory=pin)
+                          shuffle=False, num_workers=self.num_workers, pin_memory=self.pin_memory)
 
 
 # ---------------------------------------------------------------------------
@@ -236,14 +243,45 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    # -- Data -----------------------------------------------------------------
-    dm = MultiHomeDataModule(cfg, fast=fast)
-    dm.setup()
+    t = cfg["trainer"]
+
+    # -- num_workers auto-detection -------------------------------------------
+    num_workers = min(os.cpu_count() or 1, 8)
+    cfg["data"]["num_workers"] = num_workers
+
+    # -- Hardware detection ---------------------------------------------------
+    cuda_available = torch.cuda.is_available()
+    try:
+        mps_available = torch.backends.mps.is_available()
+    except AttributeError:
+        mps_available = False
+
+    if cuda_available:
+        hw_name    = f"CUDA ({torch.cuda.get_device_name(0)})"
+        precision  = "16-mixed"
+        pin_memory = True
+    elif mps_available:
+        hw_name    = "MPS (Apple Silicon)"
+        precision  = "32-true"
+        pin_memory = False
+    else:
+        hw_name    = "CPU"
+        precision  = "32-true"
+        pin_memory = False
 
     print(f"\n{'='*60}")
     print("  TRAINING RUN")
     print(f"{'='*60}")
     print(f"  Config           : {config_path.relative_to(ROOT)}")
+    print(f"  Hardware         : {hw_name}")
+    print(f"  Precision        : {precision}")
+    print(f"  pin_memory       : {pin_memory}")
+    print(f"  num_workers      : {num_workers}")
+
+    # -- Data -----------------------------------------------------------------
+    dm = MultiHomeDataModule(cfg, fast=fast, pin_memory=pin_memory)
+    dm.setup()
+
     fast_tag = " [capped]" if fast else ""
     print(f"  Train windows    (TX+CA 85%) : {len(dm._train_ds):>8,}{fast_tag}")
     print(f"  Val   windows    (TX+CA 15%) : {len(dm._val_ds):>8,}{fast_tag}")
@@ -266,10 +304,15 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
         save_top_k=3,
         save_last=True,
     )
+    early_stop_cb = VerboseEarlyStopping(
+        monitor="val_loss",
+        patience=t["early_stopping_patience"],
+        mode="min",
+        verbose=True,
+    )
     logger = CSVLogger(save_dir=str(ROOT / "logs"), name="solar_forecast")
 
     # -- Trainer --------------------------------------------------------------
-    t = cfg["trainer"]
     max_epochs = 5 if fast else t["max_epochs"]
     if fast:
         print(f"  [FAST MODE] max_epochs=5, train cap=2000, val cap=500, test cap=500")
@@ -278,13 +321,13 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
         max_epochs=max_epochs,
         accelerator=t["accelerator"],
         devices=t["devices"],
-        precision=t["precision"],
+        precision=precision,
         log_every_n_steps=t["log_every_n_steps"],
         val_check_interval=t["val_check_interval"],
         gradient_clip_val=t["gradient_clip_val"],
         enable_progress_bar=t["enable_progress_bar"],
         enable_model_summary=t["enable_model_summary"],
-        callbacks=[checkpoint_cb],
+        callbacks=[checkpoint_cb, early_stop_cb],
         logger=logger,
         default_root_dir=str(ROOT / "logs"),
     )
