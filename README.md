@@ -118,15 +118,35 @@ CS7180_final/
 ## Setup
 
 ```bash
-pip install torch lightning polars pyyaml psycopg2-binary python-dotenv boto3 requests matplotlib
+git clone https://github.com/Chaim3ra/CS7180_final
+cd CS7180_final
+conda create -n CS7180 python=3.11
+conda activate CS7180
+pip install -r requirements.txt
+pip install dvc-s3
 ```
 
-Copy `.env.example` to `.env` and fill in your API keys:
+Copy `.env.example` to `.env` and fill in your credentials:
+
+```bash
+cp .env.example .env
+# edit .env — required fields:
+#   NREL_API_KEY       — from developer.nrel.gov
+#   AWS_ACCESS_KEY_ID  — IAM key with s3:GetObject on cs7180-final-project
+#   AWS_SECRET_ACCESS_KEY
 ```
-NREL_API_KEY=<your key from developer.nrel.gov>
-PECAN_STREET_USERNAME=<your Dataport email>
-PECAN_STREET_PASSWORD=<your Dataport password>
-DATA_ROOT=<local path to data/raw/>
+
+Configure DVC S3 credentials locally (never committed):
+
+```bash
+dvc remote modify --local s3remote access_key_id     <AWS_ACCESS_KEY_ID>
+dvc remote modify --local s3remote secret_access_key <AWS_SECRET_ACCESS_KEY>
+```
+
+Pull all data (~3 GB) from S3:
+
+```bash
+dvc pull
 ```
 
 ---

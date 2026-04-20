@@ -1,6 +1,5 @@
 [core]
-    remote = gdrive
-['remote "gdrive"']
-    url = gdrive://1GVtDitnHkU-uTWqnTcF2vZDVir21m7oq
-    gdrive_acknowledge_abuse = true
-    gdrive_use_service_account = false
+    remote = s3remote
+['remote "s3remote"']
+    url = s3://cs7180-final-project/data
+    region = us-east-2
