@@ -1,5 +1,8 @@
 """End-to-end validation: data pipeline, preprocessing, windowing, model, splits.
 
+All data is read directly from S3 — no local files required.
+Only prerequisite: AWS credentials in .env and S3_BUCKET set.
+
 Exit 0 if all checks pass, 1 if any fail.
 """
 
@@ -22,6 +25,14 @@ if env_path.exists():
             k, v = raw.split("=", 1)
             os.environ.setdefault(k.strip(), v.strip())
 
+S3_BUCKET           = os.environ.get("S3_BUCKET", "")
+S3_RAW_PREFIX       = os.environ.get("S3_RAW_PREFIX", "raw")
+S3_PROCESSED_PREFIX = (
+    os.environ.get("S3_PROCESSED_PREFIX")
+    or os.environ.get("S3_DATA_PREFIX", "data/processed")
+)
+
+# Local fallback roots (used only when S3_BUCKET is not set)
 _dr = os.environ.get("DATA_ROOT", "data/raw")
 DATA_ROOT = Path(_dr) if Path(_dr).is_absolute() else ROOT / _dr
 PROCESSED = ROOT / "data" / "processed"
@@ -34,7 +45,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from src.models import build
-from src.dataloader import SolarWindowDataset
+from src.dataloader import SolarWindowDataset, read_csv, read_parquet
 
 # -- Constants ----------------------------------------------------------------
 SEQ_LEN          = 96
@@ -47,6 +58,22 @@ SOLAR_COL        = "solar_kwh"
 METADATA_COLS    = ["lat", "lon", "tilt_deg", "azimuth_deg", "capacity_kw", "elevation_m"]
 
 RESULTS: dict[str, bool] = {}
+
+
+# -- URI helpers ---------------------------------------------------------------
+
+def _raw_uri(filename: str) -> str:
+    """Return an S3 URI or local path for a raw data file."""
+    if S3_BUCKET:
+        return f"s3://{S3_BUCKET}/{S3_RAW_PREFIX}/{filename}"
+    return str(DATA_ROOT / filename)
+
+
+def _processed_uri(filename: str) -> str:
+    """Return an S3 URI or local path for a processed parquet."""
+    if S3_BUCKET:
+        return f"s3://{S3_BUCKET}/{S3_PROCESSED_PREFIX}/{filename}"
+    return str(PROCESSED / filename)
 
 
 # -- Helpers ------------------------------------------------------------------
@@ -64,11 +91,7 @@ def mark(name: str, passed: bool, msg: str = "") -> None:
 
 
 def make_dataset_from_parquet(df: pl.DataFrame, dataid: Optional[int] = None) -> SolarWindowDataset:
-    """Build a SolarWindowDataset from a processed parquet DataFrame.
-
-    Extracts weather, generation, and static metadata for a single home
-    (or the first home if dataid is None) without any CSV I/O.
-    """
+    """Build a SolarWindowDataset from a processed parquet DataFrame."""
     if dataid is not None:
         df = df.filter(pl.col("dataid") == dataid)
     meta_row = df.row(0, named=True)
@@ -88,9 +111,14 @@ def make_dataset_from_parquet(df: pl.DataFrame, dataid: Optional[int] = None) ->
 
 
 # =============================================================================
-# CHECK 1 -- DATA PIPELINE (raw file existence)
+# CHECK 1 -- DATA PIPELINE (raw file reads from S3)
 # =============================================================================
 banner(1, "DATA PIPELINE")
+
+if S3_BUCKET:
+    print(f"  Source: s3://{S3_BUCKET}/{S3_RAW_PREFIX}/")
+else:
+    print(f"  Source: {DATA_ROOT}  (S3_BUCKET not set — using local files)")
 
 FILES = [
     ("TX solar",   "pecanstreet_austin_15min_solar.csv",     "local_15min", "solar"),
@@ -105,9 +133,9 @@ FILES = [
 pipeline_ok = True
 
 for label, fname, ts_col, key_col in FILES:
-    path = DATA_ROOT / fname
+    uri = _raw_uri(fname)
     try:
-        df = pl.read_csv(path)
+        df = read_csv(uri)
         sample = df.head(100)
         null_info = (
             f"{key_col}={sample[key_col].null_count()} nulls"
@@ -128,23 +156,28 @@ mark("DATA PIPELINE", pipeline_ok,
 
 
 # =============================================================================
-# CHECK 2 -- PREPROCESSING (validate processed parquets)
+# CHECK 2 -- PREPROCESSING (validate processed parquets from S3)
 # =============================================================================
 banner(2, "PREPROCESSING")
+
+if S3_BUCKET:
+    print(f"  Source: s3://{S3_BUCKET}/{S3_PROCESSED_PREFIX}/")
+else:
+    print(f"  Source: {PROCESSED}  (S3_BUCKET not set — using local files)")
 
 preproc_ok = True
 parquets: dict[str, pl.DataFrame] = {}
 
 try:
     PARQUET_SPECS = [
-        ("TX", PROCESSED / "train_tx.parquet", 19, []),
-        ("CA", PROCESSED / "train_ca.parquet",  1, [9836]),
-        ("NY", PROCESSED / "test_ny.parquet",  14, []),
+        ("TX", "train_tx.parquet", 19, []),
+        ("CA", "train_ca.parquet",  1, [9836]),
+        ("NY", "test_ny.parquet",  14, []),
     ]
 
-    for region, path, expected_n, expected_ids in PARQUET_SPECS:
-        assert path.exists(), f"{path.name} not found -- run: python src/preprocess.py"
-        df = pl.read_parquet(path)
+    for region, fname, expected_n, expected_ids in PARQUET_SPECS:
+        uri = _processed_uri(fname)
+        df = read_parquet(uri)
         parquets[region] = df
 
         home_ids = sorted(df["dataid"].unique().to_list())
@@ -175,7 +208,7 @@ try:
         solar_max = df[SOLAR_COL].max()
         ghi_min   = df["GHI_W_m2"].min()
         ghi_max   = df["GHI_W_m2"].max()
-        print(f"  {region:<4}  {path.name:<26}  {df.height:>8,} rows  {n_homes} homes")
+        print(f"  {region:<4}  {fname:<26}  {df.height:>8,} rows  {n_homes} homes")
         print(f"        dataids    : {home_ids}")
         print(f"        solar_kwh  : [{solar_min:.4f}, {solar_max:.4f}]")
         print(f"        GHI_W_m2   : [{ghi_min:.1f}, {ghi_max:.1f}]")

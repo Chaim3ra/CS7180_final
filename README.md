@@ -87,7 +87,7 @@ persistence baseline (predict next hour = current hour).
 
 - [conda](https://docs.conda.io/en/latest/miniconda.html) (Miniconda or Anaconda)
 - git
-- AWS credentials — shared privately by Nathan (needed for `dvc pull`)
+- AWS credentials — shared privately by Nathan
 
 ### 1. Clone and install
 
@@ -97,33 +97,26 @@ cd CS7180_final
 conda create -n CS7180 python=3.11
 conda activate CS7180
 pip install -r requirements.txt
-pip install dvc dvc-s3
 ```
 
 ### 2. Configure AWS credentials (run once)
 
-```bash
-dvc remote modify --local s3remote access_key_id     YOUR_ACCESS_KEY
-dvc remote modify --local s3remote secret_access_key YOUR_SECRET_KEY
-```
-
-This writes to `.dvc/config.local`, which is gitignored and never committed.
-
-### 3. Pull all data from S3
+Copy `.env.example` to `.env` and fill in your AWS credentials:
 
 ```bash
-dvc pull
+cp .env.example .env
+# Edit .env and set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
 ```
 
-Downloads ~3 GB of raw data to `data/raw/`.
+All data streams directly from S3 — no `dvc pull` or local data download required.
 
-### 4. Validate setup
+### 3. Validate setup
 
 ```bash
 python src/validate.py
 ```
 
-### 5. Run training
+### 4. Run training
 
 ```bash
 python src/train.py
@@ -138,8 +131,8 @@ CS7180_final/
 ├── configs/
 │   └── experiment.yaml        # All hyperparameters and Trainer config
 ├── data/
-│   ├── raw.dvc                # DVC pointer — actual CSVs stored in S3
-│   └── processed.dvc
+│   ├── raw/                   # Raw CSVs — streamed from S3, not committed to git
+│   └── processed/             # Processed parquets — streamed from S3, not committed to git
 ├── docs/
 │   └── model_architecture.png # Architecture diagram
 ├── src/
