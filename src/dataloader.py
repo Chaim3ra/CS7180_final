@@ -26,6 +26,8 @@ __all__ = [
     "get_dataloader",
     "filter_solar_homes",
     "read_parquet",
+    "read_csv",
+    "write_parquet",
 ]
 
 
@@ -64,6 +66,68 @@ def read_parquet(path: Union[str, Path]) -> pl.DataFrame:
         buf.seek(0)
         return pl.read_parquet(buf)
     return pl.read_parquet(path)
+
+
+def read_csv(path: Union[str, Path], **kwargs) -> pl.DataFrame:
+    """Read a CSV file from local disk or directly from S3.
+
+    If *path* starts with ``s3://``, the file is streamed from S3 via boto3
+    into an in-memory buffer.  All keyword arguments are forwarded to
+    :func:`polars.read_csv` (e.g. ``columns``, ``dtypes``).
+
+    Args:
+        path: Local filesystem path or ``s3://bucket/key`` URI.
+        **kwargs: Forwarded to ``pl.read_csv``.
+
+    Returns:
+        Polars DataFrame.
+    """
+    path = str(path)
+    if path.startswith("s3://"):
+        try:
+            import boto3
+        except ImportError as exc:
+            raise ImportError(
+                "boto3 is required for S3 streaming. Install it with: pip install boto3"
+            ) from exc
+        without_scheme = path[5:]
+        bucket, _, key = without_scheme.partition("/")
+        s3  = boto3.client("s3")
+        buf = io.BytesIO()
+        s3.download_fileobj(bucket, key, buf)
+        buf.seek(0)
+        return pl.read_csv(buf, **kwargs)
+    return pl.read_csv(path, **kwargs)
+
+
+def write_parquet(df: pl.DataFrame, path: Union[str, Path]) -> None:
+    """Write a Polars DataFrame as parquet to local disk or S3.
+
+    If *path* starts with ``s3://``, the parquet bytes are uploaded via
+    boto3 without writing any local file.  Otherwise the file is written
+    to the local filesystem (parent directories are created automatically).
+
+    Args:
+        df: DataFrame to serialise.
+        path: Destination local path or ``s3://bucket/key`` URI.
+    """
+    path = str(path)
+    if path.startswith("s3://"):
+        try:
+            import boto3
+        except ImportError as exc:
+            raise ImportError(
+                "boto3 is required for S3 uploads. Install it with: pip install boto3"
+            ) from exc
+        without_scheme = path[5:]
+        bucket, _, key = without_scheme.partition("/")
+        buf = io.BytesIO()
+        df.write_parquet(buf)
+        buf.seek(0)
+        boto3.client("s3").upload_fileobj(buf, bucket, key)
+    else:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        df.write_parquet(path)
 
 
 def filter_solar_homes(
