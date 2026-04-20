@@ -12,3 +12,7 @@ pyarrow
 boto3
 lightning
 pyyaml
+cdsapi
+xarray
+netCDF4
+pvlib
