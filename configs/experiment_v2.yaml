@@ -1,0 +1,124 @@
+# V2 model - expanded dataset with PVDAQ + ERA5 weather
+model_version: 2
+
+model:
+  d_model: 128
+  nhead: 4
+  num_layers: 2
+  dropout: 0.1
+
+  encoders:
+    weather:
+      # GHI, DNI, DHI, temperature, wind_speed, humidity
+      input_dim: 6
+      ffn_dim: 256
+    generation:
+      # past kWh readings (univariate)
+      input_dim: 1
+      ffn_dim: 256
+    metadata:
+      # lat, lon, tilt_deg, azimuth_deg, capacity_kw, elevation_m
+      input_dim: 6
+      hidden_dim: 64
+
+  fusion:
+    # cross-attention heads (must divide d_model evenly)
+    nhead: 4
+
+  head:
+    hidden_dim: 128
+    # number of 15-min intervals to predict
+    forecast_horizon: 4
+
+data:
+  # V2 data sources (to be preprocessed into parquets)
+  #
+  # PVDAQ systems (target: 50+ systems, 5-10 years each)
+  #   - Source: DOE PVDAQ via S3 (s3://pvdaq.nrel.gov/…)
+  #   - Fetch:  python src/fetch_pvdaq.py
+  #   - States: CA, TX, NM, AZ, CO — broader geographic diversity than v1
+  #
+  # ERA5 weather (replacing NASA POWER)
+  #   - Source: Copernicus Climate Data Store (ERA5 reanalysis, hourly)
+  #   - Resolution: 0.25 deg (~28 km), matched to each PVDAQ system lat/lon
+  #   - Variables: GHI, DNI, DHI (derived), T2m, u10, v10, relative humidity
+  #   - Advantage over NASA POWER: longer history, finer spatial resolution,
+  #     consistent global coverage for NY zero-shot evaluation
+  #
+  # V1 Pecan Street data is retained as part of the training mix.
+
+  # Preprocessed parquet files produced by src/preprocess.py (v2 run)
+  # Local files are used if present; otherwise streamed from S3 (set S3_BUCKET in .env).
+  train_tx_parquet:    data/processed/train_tx.parquet      # 19 Pecan Street TX homes, 2018
+  train_ca_parquet:    data/processed/train_ca.parquet      # 1 Pecan Street CA home, 2014-2015
+  train_pvdaq_parquet: data/processed/train_pvdaq.parquet   # 50+ PVDAQ systems (TBD)
+  test_ny_parquet:     data/processed/test_ny.parquet       # 14 NY homes, 2019 (zero-shot)
+
+  # S3 location of processed parquets (used when local files are absent)
+  s3_bucket: cs7180-final-project
+  s3_data_prefix: data/processed
+
+  # Training split applied within train rows (NY is always held out)
+  train_frac: 0.85    # 85% of combined train rows -> train
+  val_frac:   0.15    # 15% of combined train rows -> val
+
+  # Column names in the processed parquet files
+  weather_cols: [GHI_W_m2, DNI_W_m2, DHI_W_m2, Temp_C, WindSpeed_m_s, RelHumidity_pct]
+  solar_col: solar_kwh
+  metadata_cols: [lat, lon, tilt_deg, azimuth_deg, capacity_kw, elevation_m]
+
+  # Sliding-window parameters (15-min resolution)
+  seq_len: 96           # context window = 24 h
+  forecast_horizon: 4   # prediction horizon = 1 h
+
+  batch_size: 32
+  # Set to 0 on CPU-only machines; 7+ recommended for multi-core GPU machines
+  num_workers: 7
+
+  # Data provenance (informational)
+  regions:
+    tx:
+      homes: 19
+      year: 2018
+      source: Pecan Street Dataport (Austin)
+      weather: ERA5 austin 2018
+      split: train
+    ca:
+      homes: 1
+      years: [2014, 2015]
+      source: Pecan Street Dataport (San Diego)
+      weather: ERA5 california 2014+2015
+      split: train
+    pvdaq:
+      systems: 50+       # target; exact count TBD after fetch + quality filter
+      years: 5-10        # per system; varies
+      source: DOE PVDAQ (S3)
+      weather: ERA5 matched to each system lat/lon
+      split: train
+      states: [CA, TX, NM, AZ, CO]
+    ny:
+      homes: 14
+      year: 2019
+      source: Pecan Street Dataport (New York)
+      weather: ERA5 newyork 2019
+      split: test_zero_shot
+
+training:
+  lr: 1.0e-4
+  weight_decay: 1.0e-5
+  epochs: 100
+  # cosine | step | none
+  scheduler: cosine
+
+trainer:
+  max_epochs: 100
+  accelerator: auto
+  devices: 1
+  # 32-true (full float32) | 16-mixed (AMP) | bf16-mixed
+  precision: 32-true
+  log_every_n_steps: 10
+  val_check_interval: 1.0
+  gradient_clip_val: 1.0
+  enable_progress_bar: true
+  enable_model_summary: true
+  default_root_dir: logs/
