@@ -5,6 +5,9 @@ zero-shot transfer evaluation.  Parquets are loaded from local disk when
 present; if local files are absent and S3_BUCKET is configured, they are
 streamed directly from S3 via boto3 — no dvc pull needed.
 
+Checkpoints are saved locally to models/checkpoints/ and mirrored to
+s3://<S3_BUCKET>/<S3_CHECKPOINT_PREFIX>/<run_id>/ after each epoch.
+
 Usage:
     python src/train.py
     python src/train.py --config configs/experiment.yaml
@@ -16,7 +19,8 @@ S3 setup (for teammates without local data):
         AWS_SECRET_ACCESS_KEY=...
         AWS_DEFAULT_REGION=us-east-2
         S3_BUCKET=cs7180-final-project
-        S3_DATA_PREFIX=data/processed   # optional, this is the default
+        S3_PROCESSED_PREFIX=data/processed   # optional, this is the default
+        S3_CHECKPOINT_PREFIX=checkpoints     # optional, this is the default
 """
 
 from __future__ import annotations
@@ -24,6 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -70,6 +75,31 @@ class VerboseEarlyStopping(EarlyStopping):
             print(f"\n  Early stopping triggered at epoch {trainer.current_epoch}")
 
 
+class S3ModelCheckpoint(ModelCheckpoint):
+    """ModelCheckpoint that mirrors every saved file to S3 in real-time.
+
+    After each local checkpoint write (best or last), uploads the file to
+    s3://<s3_bucket>/<s3_prefix>/<filename> via boto3.
+    """
+
+    def __init__(self, *args, s3_bucket: str = "", s3_prefix: str = "", **kwargs):
+        super().__init__(*args, **kwargs)
+        self._s3_bucket = s3_bucket
+        self._s3_prefix = s3_prefix.rstrip("/")
+
+    def _save_checkpoint(self, trainer, filepath: str) -> None:
+        super()._save_checkpoint(trainer, filepath)
+        if self._s3_bucket and Path(filepath).exists():
+            self._upload(filepath)
+
+    def _upload(self, filepath: str) -> None:
+        import boto3
+        filename = Path(filepath).name
+        s3_key   = f"{self._s3_prefix}/{filename}"
+        boto3.client("s3").upload_file(filepath, self._s3_bucket, s3_key)
+        print(f"  Checkpoint saved to S3: s3://{self._s3_bucket}/{s3_key}")
+
+
 # ---------------------------------------------------------------------------
 # Path resolution: local-first, S3 fallback
 # ---------------------------------------------------------------------------
@@ -81,34 +111,28 @@ def _resolve_parquet(local_rel: str, cfg: dict) -> str:
       1. Local file at ``ROOT/local_rel`` — use it if it exists.
       2. S3 URI constructed from S3_BUCKET env var (or config) — if set.
       3. Raise ``FileNotFoundError`` with setup instructions.
-
-    Args:
-        local_rel: Relative path from repo root, e.g. ``data/processed/train_tx.parquet``.
-        cfg:       Loaded experiment config dict.
-
-    Returns:
-        Absolute local path string or ``s3://bucket/prefix/filename`` URI.
     """
     local = ROOT / local_rel
     if local.exists():
         return str(local)
 
-    # S3 fallback: env var takes precedence over config
     d      = cfg.get("data", {})
     bucket = os.environ.get("S3_BUCKET") or d.get("s3_bucket", "")
-    prefix = os.environ.get("S3_DATA_PREFIX") or d.get("s3_data_prefix", "data/processed")
+    prefix = (
+        os.environ.get("S3_PROCESSED_PREFIX")
+        or os.environ.get("S3_DATA_PREFIX")
+        or d.get("s3_data_prefix", "data/processed")
+    )
 
     if bucket:
         filename = Path(local_rel).name
-        s3_uri   = f"s3://{bucket}/{prefix.rstrip('/')}/{filename}"
-        return s3_uri
+        return f"s3://{bucket}/{prefix.rstrip('/')}/{filename}"
 
     raise FileNotFoundError(
         f"Parquet not found locally: {local}\n"
-        f"Either run `dvc pull` to download data locally, or set S3_BUCKET in .env "
-        f"to stream directly from S3.\n"
+        f"Set S3_BUCKET in .env to stream directly from S3.\n"
         f"  S3_BUCKET=cs7180-final-project\n"
-        f"  S3_DATA_PREFIX=data/processed  # default if omitted"
+        f"  S3_PROCESSED_PREFIX=data/processed  # default if omitted"
     )
 
 
@@ -167,7 +191,6 @@ class MultiHomeDataModule(L.LightningDataModule):
     def __init__(self, cfg: dict, fast: bool = False, pin_memory: bool = False):
         super().__init__()
         d = cfg["data"]
-        # Resolve each parquet: local path if it exists, S3 URI otherwise.
         self.tx_path          = _resolve_parquet(d["train_tx_parquet"], cfg)
         self.ca_path          = _resolve_parquet(d["train_ca_parquet"], cfg)
         self.ny_path          = _resolve_parquet(d["test_ny_parquet"],  cfg)
@@ -177,7 +200,6 @@ class MultiHomeDataModule(L.LightningDataModule):
         self.batch_size       = d["batch_size"]
         self.num_workers      = d["num_workers"]
         self.pin_memory       = pin_memory
-        # In fast mode cap windows so CPU smoke-test finishes in seconds.
         self.fast_train_cap = 2_000 if fast else None
         self.fast_val_cap   =   500 if fast else None
         self.fast_test_cap  =   500 if fast else None
@@ -187,7 +209,6 @@ class MultiHomeDataModule(L.LightningDataModule):
         self._test_ds  = None
 
     def setup(self, stage: Optional[str] = None) -> None:
-        # read_parquet handles both local paths and s3:// URIs transparently
         tx = read_parquet(self.tx_path)
         ca = read_parquet(self.ca_path)
         ny = read_parquet(self.ny_path)
@@ -245,6 +266,9 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
 
     t = cfg["trainer"]
 
+    # -- Run ID (timestamp) ---------------------------------------------------
+    run_id = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
     # -- num_workers auto-detection -------------------------------------------
     num_workers = min(os.cpu_count() or 1, 8)
     cfg["data"]["num_workers"] = num_workers
@@ -269,14 +293,22 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
         precision  = "32-true"
         pin_memory = False
 
+    # -- S3 checkpoint config -------------------------------------------------
+    s3_bucket      = os.environ.get("S3_BUCKET", "")
+    s3_ckpt_prefix = os.environ.get("S3_CHECKPOINT_PREFIX", "checkpoints")
+    s3_run_prefix  = f"{s3_ckpt_prefix}/{run_id}" if s3_bucket else ""
+
     print(f"\n{'='*60}")
     print("  TRAINING RUN")
     print(f"{'='*60}")
     print(f"  Config           : {config_path.relative_to(ROOT)}")
+    print(f"  Run ID           : {run_id}")
     print(f"  Hardware         : {hw_name}")
     print(f"  Precision        : {precision}")
     print(f"  pin_memory       : {pin_memory}")
     print(f"  num_workers      : {num_workers}")
+    if s3_bucket:
+        print(f"  S3 checkpoints   : s3://{s3_bucket}/{s3_run_prefix}/")
 
     # -- Data -----------------------------------------------------------------
     dm = MultiHomeDataModule(cfg, fast=fast, pin_memory=pin_memory)
@@ -296,13 +328,15 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
     ckpt_dir = ROOT / "models" / "checkpoints"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_cb = ModelCheckpoint(
+    checkpoint_cb = S3ModelCheckpoint(
         dirpath=str(ckpt_dir),
         filename="solar-{epoch:02d}-{val_loss:.4f}",
         monitor="val_loss",
         mode="min",
         save_top_k=3,
         save_last=True,
+        s3_bucket=s3_bucket,
+        s3_prefix=s3_run_prefix,
     )
     early_stop_cb = VerboseEarlyStopping(
         monitor="val_loss",
@@ -354,6 +388,8 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
     print(f"  Out-region MAE  (NY zero-shot) : {out_mae:.4f} kWh")
     print(f"  Generalization gap             : {gap:+.4f} kWh")
     print(f"\n  Best checkpoint : {checkpoint_cb.best_model_path}")
+    if s3_bucket:
+        print(f"  S3 checkpoints  : s3://{s3_bucket}/{s3_run_prefix}/")
     print(f"  CSV logs        : {logger.log_dir}")
     print(f"{'='*60}\n")
 
