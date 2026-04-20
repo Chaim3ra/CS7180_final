@@ -1,4 +1,1 @@
-data/raw/pecanstreet_austin_15min_solar.csv filter=lfs diff=lfs merge=lfs -text
-data/raw/pecanstreet_austin_1min_solar.csv filter=lfs diff=lfs merge=lfs -text
-data/raw/pecanstreet_california_1min_solar.csv filter=lfs diff=lfs merge=lfs -text
-data/raw/pecanstreet_newyork_1min_solar.csv filter=lfs diff=lfs merge=lfs -text
+# LFS tracking removed — data/raw/ is now managed by DVC (see data/raw.dvc)

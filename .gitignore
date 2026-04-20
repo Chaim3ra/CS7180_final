@@ -1,5 +1,7 @@
 # Credentials — never commit
 .env
+credentials.json
+oauth_credentials.json
 
 # Python
 __pycache__/
