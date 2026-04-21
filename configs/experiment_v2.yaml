@@ -1,27 +1,27 @@
 model_version: v2
 
 model:
-  d_model: 256
-  nhead: 8
-  num_layers: 3
+  d_model: 128
+  nhead: 4
+  num_layers: 2
   dropout: 0.1
 
   encoders:
     weather:
       input_dim: 6
-      ffn_dim: 512
+      ffn_dim: 256
     generation:
       input_dim: 1
-      ffn_dim: 512
+      ffn_dim: 256
     metadata:
       input_dim: 6
-      hidden_dim: 128
+      hidden_dim: 64
 
   fusion:
-    nhead: 8
+    nhead: 4
 
   head:
-    hidden_dim: 256
+    hidden_dim: 128
     forecast_horizon: 4
 
 data:
@@ -47,7 +47,7 @@ data:
   num_workers: 7
 
 training:
-  lr:           5.0e-5
+  lr:           1.0e-4
   weight_decay: 1.0e-5
   epochs:       50
   scheduler:    cosine
