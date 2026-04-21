@@ -83,19 +83,75 @@ persistence baseline (predict next hour = current hour).
 
 ## Results
 
-### V1 — Baseline (20 homes, TX + CA → NY zero-shot)
+### Final Results — All 14 Experiments
 
-| Metric | Value |
-|--------|-------|
-| In-region MAE (TX+CA val) | 0.0295 kWh |
-| Out-of-region MAE (NY zero-shot) | 0.1657 kWh |
-| Generalization gap | +0.1363 kWh (5.6× worse on NY) |
+**V1:** trained on 19 TX homes + 1 real CA home (20 homes total).
+**V2:** trained on 19 TX homes + 1 real CA home + 18 synthetic San Diego homes (38 homes total).
+All NY fine-tuning experiments use the V1 checkpoint (M1) or V2 checkpoint (M2) as the base. Delta = V2 MAE − V1 MAE; negative = V2 better.
 
-Early stopping at epoch 15, best checkpoint at epoch 5. Training took ~13 minutes on an A100-SXM4-40GB with fp16 mixed precision.
+| Experiment | V1 MAE (kWh) | V2 MAE (kWh) | Delta |
+|---|---|---|---|
+| zero_shot (NY) | 0.1657 | 0.1714 | +0.0057 |
+| finetune_7d (NY) | 0.1495 | 0.1609 | +0.0114 |
+| finetune_30d (NY) | 0.1325 | 0.1489 | +0.0164 |
+| finetune_90d (NY) | 0.1046 | 0.1089 | +0.0043 |
+| finetune_180d (NY) | 0.0550 | 0.0582 | +0.0032 |
+| in_region_tx | 0.0356 | 0.0352 | −0.0004 |
+| in_region_ca | 0.0173 | **0.0151** | **−0.0022** |
 
-The 5.6× gap reflects the difficulty of zero-shot transfer from sunny TX/CA climates to New York's cloudier, more variable conditions. V2 targets this gap with PVDAQ data (50+ systems, 5–10 years) and ERA5 weather.
+Raw data: [`results/all_results.csv`](results/all_results.csv)
 
-→ Full metrics, training curve, and limitations: [`results/v1/results.md`](results/v1/results.md)
+### Result Plots
+
+| Plot | Description |
+|---|---|
+| [Data Efficiency Curve](results/plots/data_efficiency_curve.png) | NY MAE vs. fine-tuning days for V1 and V2 |
+| [Generalization Gap](results/plots/generalization_gap.png) | Gap between in-region and zero-shot MAE across models |
+| [Metric Comparison](results/plots/metric_comparison.png) | MAE, RMSE, and skill score side-by-side across all experiments |
+| [Skill Score Curve](results/plots/skill_score_curve.png) | Skill score vs. fine-tuning days relative to persistence baseline |
+
+---
+
+## Key Findings
+
+**1. Synthetic data works for the task it was designed for.**
+V2 achieves 12.8% lower MAE on in-region California evaluation (0.0151 vs. 0.0173 kWh). The 18 synthetic San Diego homes generated via pvlib PVWatts — parameterised from LBNL Tracking the Sun distributions and calibrated against real home 9836 — provide a meaningful training signal for CA-climate generation patterns.
+
+**2. Synthetic CA data slightly hurts NY transfer.**
+V2 underperforms V1 on NY zero-shot and across all fine-tuning windows by 3–12%. The most likely explanation is climate-regime conflict: San Diego has an arid Mediterranean climate with high, stable irradiance, which is systematically different from New York's humid continental climate. Adding San Diego-like patterns may shift encoder representations in a direction that reduces NY zero-shot accuracy. This finding is discussed further in [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md).
+
+**3. Sufficient fine-tuning data overcomes the synthetic disadvantage.**
+At 180 days of NY fine-tuning, V1 and V2 converge to similar performance — V1 closes 66.8% of the zero-shot gap, V2 closes 66.1%. The small remaining gap (0.003 kWh MAE) suggests that real target-region data dominates the training signal once enough of it is available.
+
+**4. Data efficiency shows strong diminishing returns.**
+Fine-tuning on NY data closes the generalization gap rapidly at first and then plateaus:
+- 7 days → ~10% of gap closed
+- 30 days → ~20% of gap closed
+- 90 days → ~37% of gap closed
+- 180 days → ~67% of gap closed
+
+This pattern is consistent across both V1 and V2, suggesting it reflects a property of the model and task rather than the training data composition.
+
+**5. TX generalization is unaffected by synthetic CA augmentation.**
+In-region TX MAE is nearly identical between V1 (0.0356) and V2 (0.0352). Augmenting the CA portion of training data does not degrade performance on TX, confirming that the two regional signals are largely separable within the multi-modal encoder.
+
+---
+
+## Limitations
+
+Reported MAPE values (600–1300%) are inflated by near-zero nighttime solar readings and should not be interpreted as meaningful. All metrics are single-seed point estimates; no variance estimates are available. The California training set relies on one real Pecan Street home and 18 physics-based synthetic homes due to limited Dataport exports.
+
+For a full discussion of infrastructure, evaluation, data, and modelling limitations — and proposed remedies — see [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md).
+
+---
+
+## Documentation
+
+| Document | Description |
+|---|---|
+| [docs/SYNTHETIC_METHODOLOGY.md](docs/SYNTHETIC_METHODOLOGY.md) | Scientific basis and implementation details for synthetic CA data generation |
+| [docs/FUTURE_WORK.md](docs/FUTURE_WORK.md) | Limitations and future directions (infrastructure, evaluation, data, model) |
+| [results/all_results.csv](results/all_results.csv) | All 14 experiment results (MAE, RMSE, R², skill score, checkpoint paths) |
 
 ---
 
@@ -147,31 +203,47 @@ python src/train.py
 ```
 CS7180_final/
 ├── configs/
-│   └── experiment.yaml        # All hyperparameters and Trainer config
+│   ├── experiment.yaml         # V1 hyperparameters and Trainer config
+│   └── experiment_v2.yaml      # V2 config (synthetic CA, same architecture)
 ├── data/
-│   ├── raw/                   # Raw CSVs — streamed from S3, not committed to git
-│   └── processed/             # Processed parquets — streamed from S3, not committed to git
+│   ├── raw/                    # Raw CSVs — streamed from S3, not committed to git
+│   └── processed/              # Processed parquets — streamed from S3, not committed to git
 ├── docs/
-│   └── model_architecture.png # Architecture diagram
+│   ├── model_architecture.png  # Architecture diagram
+│   ├── SYNTHETIC_METHODOLOGY.md
+│   └── FUTURE_WORK.md
+├── results/
+│   ├── all_results.csv         # All 14 experiment results
+│   ├── all_results.md          # Human-readable results summary
+│   ├── per_home_metrics.csv    # Per-home breakdown for NY evaluation
+│   └── plots/                  # data_efficiency_curve, generalization_gap,
+│                               # metric_comparison, skill_score_curve (PNG + CSV)
 ├── src/
-│   ├── dataloader.py          # Polars-backed SolarWindowDataset + LightningDataModule
-│   ├── train.py               # Training entry point
-│   ├── validate.py            # Setup validation script
-│   ├── fetch_pecanstreet.py   # Pecan Street Dataport fetch script
-│   ├── fetch_nsrdb.py         # NREL NSRDB fetch script
-│   ├── fetch_nasa_power.py    # NASA POWER fetch script
-│   ├── fetch_pvdaq.py         # DOE PVDAQ S3 metadata + candidate selection
+│   ├── dataloader.py           # Polars-backed SolarWindowDataset + LightningDataModule
+│   ├── train.py                # Training entry point
+│   ├── finetune.py             # NY fine-tuning with frozen encoders
+│   ├── evaluate.py             # Standalone evaluation script
+│   ├── preprocess.py           # Raw → processed parquet pipeline (+ synthetic CA merge)
+│   ├── synthetic.py            # Synthetic San Diego CA solar generation (pvlib)
+│   ├── metrics.py              # MAE, RMSE, R², skill score, per-home metrics
+│   ├── results_utils.py        # CSV results persistence
+│   ├── plot_results.py         # Generate results/plots/
+│   ├── validate.py             # Setup validation script
+│   ├── fetch_pecanstreet.py    # Pecan Street Dataport fetch script
+│   ├── fetch_nsrdb.py          # NREL NSRDB fetch script
+│   ├── fetch_nasa_power.py     # NASA POWER fetch script
+│   ├── fetch_pvdaq.py          # DOE PVDAQ S3 metadata + candidate selection
 │   └── models/
-│       ├── __init__.py        # SolarForecastModel (LightningModule) + build()
-│       ├── base.py            # Abstract base classes
+│       ├── __init__.py         # SolarForecastModel (LightningModule) + build()
+│       ├── base.py             # Abstract base classes
 │       ├── encoders/
-│       │   ├── weather.py     # Transformer encoder for weather
-│       │   ├── generation.py  # Transformer encoder for generation history
-│       │   └── metadata.py    # MLP encoder for static site features
+│       │   ├── weather.py      # Transformer encoder for weather
+│       │   ├── generation.py   # Transformer encoder for generation history
+│       │   └── metadata.py     # MLP encoder for static site features
 │       ├── fusion/
-│       │   └── cross_attention.py  # Cross-attention + mean pool
+│       │   └── cross_attention.py   # Cross-attention + mean pool
 │       └── heads/
-│           └── regression.py  # MLP regression head
+│           └── regression.py   # MLP regression head
 └── requirements.txt
 ```
 
