@@ -1,0 +1,137 @@
+model:
+  d_model: 256
+  nhead: 8
+  num_layers: 3
+  dropout: 0.1
+
+  encoders:
+    weather:
+      input_dim: 6
+      ffn_dim: 512
+    generation:
+      input_dim: 1
+      ffn_dim: 512
+    metadata:
+      input_dim: 6
+      hidden_dim: 128
+
+  fusion:
+    nhead: 8
+
+  head:
+    hidden_dim: 256
+    forecast_horizon: 4
+
+data:
+  train_tx_parquet:        data/processed/train_tx.parquet
+  train_ca_parquet:        data/processed/train_ca.parquet
+  train_ca_synthetic_parquet: data/processed/train_ca_synthetic.parquet
+  test_ny_parquet:         data/processed/test_ny.parquet
+
+  s3_bucket:        cs7180-final-project
+  s3_data_prefix:   data/processed
+
+  train_frac: 0.85
+  val_frac:   0.15
+
+  weather_cols: [GHI_W_m2, DNI_W_m2, DHI_W_m2, Temp_C, WindSpeed_m_s, RelHumidity_pct]
+  solar_col:    solar_kwh
+  metadata_cols: [lat, lon, tilt_deg, azimuth_deg, capacity_kw, elevation_m]
+
+  seq_len:          96
+  forecast_horizon: 4
+
+  batch_size:  256
+  num_workers: 7
+
+training:
+  lr:           5.0e-5
+  weight_decay: 1.0e-5
+  epochs:       50
+  scheduler:    cosine
+
+trainer:
+  max_epochs:               50
+  accelerator:              "auto"
+  devices:                  "auto"
+  precision:                "32-true"
+  pin_memory:               false
+  early_stopping_patience:  10
+  log_every_n_steps:        100
+  val_check_interval:       1.0
+  gradient_clip_val:        1.0
+  enable_progress_bar:      true
+  enable_model_summary:     true
+  default_root_dir:         logs/
+
+# ---------------------------------------------------------------------------
+# Synthetic CA data generation settings
+# All tunable parameters for src/synthetic.py live here.
+# ---------------------------------------------------------------------------
+synthetic:
+  # Output date range — matches real Pecan Street home 9836 exactly
+  date_start: "2014-07-08"
+  date_end:   "2015-06-30"
+
+  # Total number of synthetic homes to generate
+  n_homes: 18
+
+  # Stratified building-type allocation (must sum to n_homes)
+  building_type_targets:
+    Apartment:                       9
+    Town Home:                       7
+    "Single-Family Home 001 (Master)": 2
+
+  # Civita development centroid (San Diego) — all host homes offset from here
+  civita_lat:  32.7849
+  civita_lon: -117.1539
+  civita_elev: 10.0        # metres above sea level
+
+  # Per-home lat/lon jitter (degrees) — keeps homes distinct while clustering
+  # at Civita. ±0.005° ≈ ±550 m, well within the Civita campus.
+  lat_lon_offset_deg: 0.005
+
+  # Panel parameter sampling bounds from Tracking the Sun RES_SF distribution.
+  # Values outside [lo_pct, hi_pct] are excluded to avoid implausible outliers.
+  param_sampling:
+    size_pct_lo:  10
+    size_pct_hi:  90
+    tilt_pct_lo:  10
+    tilt_pct_hi:  90
+    az_pct_lo:    10
+    az_pct_hi:    90
+    # Apartments draw from [size_pct_lo, 50]; SFH from [50, size_pct_hi]
+    apt_size_pct_hi: 50
+    sfh_size_pct_lo: 50
+
+  # Module technology mix (from Tracking the Sun San Diego RES_SF, 2024)
+  module_type_mono_fraction: 0.807   # 75% mono / (75+18)% = 0.807
+
+  # pvlib PVWatts configuration
+  pvlib:
+    # Temperature model: SAPM open-rack glass-polymer
+    # Open-rack is conservative (slightly hotter than roof-mounted) but avoids
+    # underestimating generation at high temperatures — appropriate for San Diego.
+    temperature_model:  "sapm"
+    racking:            "open_rack_glass_polymer"
+    gamma_pdc:          -0.004    # %/°C temperature coefficient (typical c-Si)
+    eta_inv_nom:        0.96      # nominal inverter efficiency (typical string inverter)
+
+  # Noise calibration: Gaussian noise added to pvlib AC output to match the
+  # per-hour-of-day variance observed in real home 9836.
+  noise_scale: 1.0   # multiplier on per-hour std; 1.0 = match real variance exactly
+
+  # Data source paths (relative to repo root)
+  host_homes_csv:       data/raw/sandiego_homes_metadata.csv
+  tts_sandiego_csv:     data/raw/tracking_the_sun_sandiego.csv
+  real_ca_solar_csv:    data/raw/pecanstreet_california_1min_solar.csv
+  real_ca_home_id:      "9836"
+  weather_years:        [2014, 2015]
+  weather_prefix:       "data/raw/nasa_power_california"
+
+  # Output paths
+  output_parquet:        data/processed/train_ca_synthetic.parquet
+  output_params_csv:     data/processed/synthetic_ca_parameters.csv
+  output_plot:           results/v2/synthetic_vs_real_daily.png
+  s3_output_key:         data/processed/train_ca_synthetic.parquet
+  schema_source_csv:     data/raw/pecanstreet_california_1min_solar.csv
