@@ -1,6 +1,6 @@
 # Solar Forecasting — All Experiment Results
 
-*Generated: 2026-04-21 17:58:43*
+*Generated: 2026-04-21 17:59:22*
 
 ## Metric Definitions
 
@@ -16,6 +16,7 @@
 
 | model_version | experiment | ny_days | mae | rmse | r2 | skill_score | peak_mae |
 |---|---|---|---|---|---|---|---|
+| v2 | in_region_ca | 0 | 0.0151 | 0.0406 | 0.894 | 11.286 | 0.0388 |
 | v1 | in_region_ca | 0 | 0.0173 | 0.0333 | 0.946 | 8.618 | 0.0344 |
 | v2 | in_region_tx | 0 | 0.0352 | 0.0765 | 0.935 | 56.213 | 0.0787 |
 | v1 | in_region_tx | 0 | 0.0356 | 0.0739 | 0.939 | 55.669 | 0.0779 |
@@ -121,6 +122,18 @@
 - checkpoint_s3_path: s3://cs7180-final-project/checkpoints/2026-04-21_01-40-26/solar-epoch=04-val_loss=0.0042.ckpt
 
 ## v2
+
+### in_region_ca (ny_days=0)
+
+- mae: 0.0151
+- rmse: 0.0406
+- mape: 126.5035
+- r2: 0.8937
+- skill_score: 11.2863
+- peak_mae: 0.0388
+- generalization_gap: 
+- timestamp: 2026-04-21T17:59:22
+- checkpoint_s3_path: s3://cs7180-final-project/checkpoints/2026-04-21_09-21-34/solar-epoch=02-val_loss=0.0035.ckpt
 
 ### in_region_tx (ny_days=0)
 
