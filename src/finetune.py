@@ -60,6 +60,8 @@ except ImportError:
 
 from src.models import SolarForecastModel, build
 from src.dataloader import SolarWindowDataset, read_parquet, ensure_local_parquet
+from src.evaluate import evaluate_from_loader, evaluate_parquet
+from src.results_utils import auto_commit, save_per_home, save_row
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -445,84 +447,7 @@ class NYFineTuneDataModule(L.LightningDataModule):
         )
 
 
-# ---------------------------------------------------------------------------
-# Results logging
-# ---------------------------------------------------------------------------
-
-_TABLE_HEADER = (
-    "| model_version | ny_days | zero_shot_mae | finetuned_mae | "
-    "improvement | pct_gap_closed | epoch_stopped | timestamp | checkpoint_s3_path |\n"
-    "|---|---|---|---|---|---|---|---|---|\n"
-)
-
-
-def _row_matches(line: str, model_version: str, ny_days: int) -> bool:
-    """Return True if a markdown table row matches the given key."""
-    parts = [p.strip() for p in line.strip().strip("|").split("|")]
-    return (
-        len(parts) >= 2
-        and parts[0] == model_version
-        and parts[1] == str(ny_days)
-    )
-
-
-def save_results(results: dict) -> None:
-    """Write or update the fine-tuning results markdown table.
-
-    Creates ``results/{model_version}/finetune_results.md`` if absent, then
-    appends a new row (or overwrites the existing row for the same
-    model_version + ny_days combination).
-
-    Args:
-        results: Dict with keys matching the table columns.
-    """
-    model_version = results["model_version"]
-    ny_days       = results["ny_days"]
-    results_dir   = ROOT / "results" / model_version
-    results_dir.mkdir(parents=True, exist_ok=True)
-    results_path  = results_dir / "finetune_results.md"
-
-    new_row = (
-        f"| {model_version} | {ny_days} "
-        f"| {results['zero_shot_mae']:.4f} "
-        f"| {results['finetuned_mae']:.4f} "
-        f"| {results['improvement']:.4f} "
-        f"| {results['pct_gap_closed']:.1f} "
-        f"| {results['epoch_stopped']} "
-        f"| {results['timestamp']} "
-        f"| {results['checkpoint_s3_path']} |\n"
-    )
-
-    if not results_path.exists():
-        results_path.write_text(
-            f"# Fine-tuning Results — {model_version}\n\n"
-            + _TABLE_HEADER
-            + new_row,
-            encoding="utf-8",
-        )
-        print(f"  Created: {results_path}", flush=True)
-        return
-
-    existing = results_path.read_text(encoding="utf-8")
-    lines    = existing.splitlines(keepends=True)
-    replaced = False
-    out_lines = []
-    for line in lines:
-        if line.startswith("|") and _row_matches(line, model_version, ny_days):
-            out_lines.append(new_row)
-            replaced = True
-        else:
-            out_lines.append(line)
-
-    if not replaced:
-        # Ensure file ends with newline before appending
-        if out_lines and not out_lines[-1].endswith("\n"):
-            out_lines[-1] += "\n"
-        out_lines.append(new_row)
-
-    results_path.write_text("".join(out_lines), encoding="utf-8")
-    action = "Updated" if replaced else "Appended to"
-    print(f"  {action}: {results_path}", flush=True)
+# (Results logging moved to src/results_utils.py — save_row / save_per_home)
 
 
 # ---------------------------------------------------------------------------
@@ -607,7 +532,10 @@ def main() -> None:
         if not Path(ckpt_local).exists():
             raise FileNotFoundError(f"Checkpoint not found: {ckpt_local}")
 
-    base_model = SolarForecastModel.load_from_checkpoint(ckpt_local)
+    from src.models import build as _build_model
+    base_model = _build_model(config_path)
+    ckpt_data  = torch.load(ckpt_local, map_location="cpu", weights_only=False)
+    base_model.load_state_dict(ckpt_data["state_dict"])
     base_model.eval()
     print(f"  Loaded checkpoint: {Path(ckpt_local).name}")
 
@@ -619,21 +547,12 @@ def main() -> None:
 
     # -- Zero-shot baseline ---------------------------------------------------
     print(f"\n[3/5] Zero-shot baseline evaluation (full NY, all homes)")
-    full_dm = FullNYDataModule(ny_local, cfg, num_workers=num_workers, pin_memory=pin_memory)
-    full_dm.setup()
-    print(f"  Full NY windows : {len(full_dm._test_ds):,}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    fh = cfg["data"]["forecast_horizon"]
 
-    zs_trainer = L.Trainer(
-        accelerator=t["accelerator"],
-        devices=t["devices"],
-        precision=precision,
-        enable_progress_bar=False,
-        enable_model_summary=False,
-        logger=False,
-    )
-    zs_results   = zs_trainer.test(base_model, dataloaders=full_dm.test_dataloader(), verbose=False)
-    zero_shot_mae = float(zs_results[0]["test_mae"])
-    print(f"  Zero-shot baseline MAE: {zero_shot_mae:.4f} kWh")
+    zs_metrics, zs_per_home = evaluate_parquet(base_model, ny_local, cfg, device=device)
+    zero_shot_mae = zs_metrics["mae"]
+    print(f"  Zero-shot MAE: {zero_shot_mae:.4f} kWh  R²={zs_metrics['r2']:.3f}  Skill={zs_metrics['skill_score']:.1f}%")
 
     # -- Fine-tune data split -------------------------------------------------
     print(f"\n[4/5] Preparing fine-tune / eval split ({args.ny_days}-day window per home)")
@@ -721,48 +640,91 @@ def main() -> None:
 
     # -- Post-fine-tune evaluation on held-out eval set -----------------------
     best_ckpt = checkpoint_cb.best_model_path or "best"
-    eval_results  = ft_trainer.test(ft_model, dataloaders=ft_dm.test_dataloader(),
-                                    ckpt_path=best_ckpt, verbose=False)
-    finetuned_mae = float(eval_results[0]["test_mae"])
+    if best_ckpt != "best" and Path(best_ckpt).exists():
+        best_ft_model = _build_model(config_path)
+        ft_ckpt_data  = torch.load(best_ckpt, map_location="cpu", weights_only=False)
+        best_ft_model.load_state_dict(ft_ckpt_data["state_dict"])
+    else:
+        best_ft_model = ft_model
+    best_ft_model.eval()
 
+    ft_metrics = evaluate_from_loader(
+        best_ft_model, ft_dm.test_dataloader(), device=device, forecast_horizon=fh
+    )
+    finetuned_mae  = ft_metrics["mae"]
     improvement    = zero_shot_mae - finetuned_mae
     pct_gap_closed = (improvement / zero_shot_mae * 100) if zero_shot_mae > 0 else 0.0
 
     # -- S3 checkpoint path for logging ---------------------------------------
     if s3_bucket and checkpoint_cb.best_model_path:
-        best_fname       = Path(checkpoint_cb.best_model_path).name
-        ckpt_s3_path     = f"s3://{s3_bucket}/{s3_ft_prefix}/{best_fname}"
+        best_fname   = Path(checkpoint_cb.best_model_path).name
+        ckpt_s3_path = f"s3://{s3_bucket}/{s3_ft_prefix}/{best_fname}"
     elif not ckpt_str.startswith("s3://"):
         ckpt_s3_path = checkpoint_cb.best_model_path or "local"
     else:
         ckpt_s3_path = f"s3://{s3_bucket}/{s3_ft_prefix}/" if s3_bucket else "local"
 
+    experiment_name = f"finetune_{args.ny_days}d"
+
     # -- Print results --------------------------------------------------------
     print(f"\n{'='*65}")
     print("  FINE-TUNING RESULTS")
     print(f"{'='*65}")
-    print(f"  Zero-shot baseline MAE  : {zero_shot_mae:.4f} kWh")
-    print(f"  Fine-tuned MAE ({args.ny_days:2d} days) : {finetuned_mae:.4f} kWh")
-    print(f"  Absolute improvement    : {improvement:+.4f} kWh")
-    print(f"  Gap closed              : {pct_gap_closed:.1f}%")
-    print(f"  Early stopping epoch    : {epoch_stopped}")
-    print(f"  Best checkpoint         : {checkpoint_cb.best_model_path or 'N/A'}")
+    print(f"  Zero-shot baseline MAE    : {zero_shot_mae:.4f} kWh")
+    print(f"  Fine-tuned MAE ({args.ny_days:2d} days)  : {finetuned_mae:.4f} kWh")
+    print(f"  Fine-tuned RMSE           : {ft_metrics['rmse']:.4f} kWh")
+    print(f"  Fine-tuned R²             : {ft_metrics['r2']:.4f}")
+    print(f"  Fine-tuned Skill score    : {ft_metrics['skill_score']:.2f}%")
+    print(f"  Absolute improvement      : {improvement:+.4f} kWh")
+    print(f"  Gap closed                : {pct_gap_closed:.1f}%")
+    print(f"  Early stopping epoch      : {epoch_stopped}")
+    print(f"  Best checkpoint           : {checkpoint_cb.best_model_path or 'N/A'}")
     if s3_bucket:
-        print(f"  S3 path                 : {ckpt_s3_path}")
+        print(f"  S3 path                   : {ckpt_s3_path}")
     print(f"{'='*65}\n")
 
     # -- Save results ---------------------------------------------------------
-    save_results({
-        "model_version":    args.model_version,
-        "ny_days":          args.ny_days,
-        "zero_shot_mae":    zero_shot_mae,
-        "finetuned_mae":    finetuned_mae,
-        "improvement":      improvement,
-        "pct_gap_closed":   pct_gap_closed,
-        "epoch_stopped":    epoch_stopped,
-        "timestamp":        datetime.now().strftime("%Y-%m-%dT%H:%M:%S"),
+    import math as _math
+    now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+    # Zero-shot row (saves baseline for comparison)
+    save_row({
+        "model_version":      args.model_version,
+        "experiment":         "zero_shot",
+        "ny_days":            0,
+        **{k: ("" if isinstance(v, float) and _math.isnan(v) else v) for k, v in zs_metrics.items()},
+        "generalization_gap": "",
+        "epoch_stopped":      "",
+        "timestamp":          now_str,
+        "checkpoint_s3_path": ckpt_str,
+    })
+
+    # Fine-tuned row
+    save_row({
+        "model_version":      args.model_version,
+        "experiment":         experiment_name,
+        "ny_days":            args.ny_days,
+        **{k: ("" if isinstance(v, float) and _math.isnan(v) else v) for k, v in ft_metrics.items()},
+        "generalization_gap": "",
+        "epoch_stopped":      epoch_stopped,
+        "timestamp":          now_str,
         "checkpoint_s3_path": ckpt_s3_path,
     })
+
+    # Per-home from zero-shot
+    save_per_home([
+        {"model_version": args.model_version, "experiment": "zero_shot",
+         "ny_days": 0, "timestamp": now_str, **h}
+        for h in zs_per_home
+    ])
+
+    auto_commit(
+        mae=finetuned_mae,
+        r2=ft_metrics["r2"] if not _math.isnan(ft_metrics["r2"]) else 0.0,
+        skill=ft_metrics["skill_score"],
+        model_version=args.model_version,
+        experiment=experiment_name,
+    )
 
     # Cleanup temp checkpoint if we downloaded from S3
     if args.checkpoint.startswith("s3://"):

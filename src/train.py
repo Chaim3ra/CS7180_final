@@ -61,6 +61,8 @@ except ImportError:
 
 from src.models import build
 from src.dataloader import SolarWindowDataset, read_parquet, ensure_local_parquet
+from src.evaluate import evaluate_from_loader, evaluate_parquet
+from src.results_utils import auto_commit, save_per_home, save_row
 
 WEATHER_COLS  = ["GHI_W_m2", "DNI_W_m2", "DHI_W_m2", "Temp_C", "WindSpeed_m_s", "RelHumidity_pct"]
 SOLAR_COL     = "solar_kwh"
@@ -416,21 +418,75 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
 
     best_ckpt = checkpoint_cb.best_model_path or "best"
 
-    val_results  = trainer.validate(model, datamodule=dm, ckpt_path=best_ckpt, verbose=False)
-    test_results = trainer.test(model,     datamodule=dm, ckpt_path=best_ckpt, verbose=False)
+    # Reload best model for evaluation (avoids using in-memory state from last epoch)
+    if best_ckpt != "best" and Path(best_ckpt).exists():
+        eval_model = build(config_path)
+        best_ckpt_data = torch.load(best_ckpt, map_location="cpu", weights_only=False)
+        eval_model.load_state_dict(best_ckpt_data["state_dict"])
+    else:
+        eval_model = model
+    eval_model.eval()
 
-    in_mae  = val_results[0]["val_mae"]
-    out_mae = test_results[0]["test_mae"]
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    fh = cfg["data"]["forecast_horizon"]
+
+    # In-region: full metrics on TX+CA val loader
+    print("  Computing in-region TX+CA val metrics…")
+    in_metrics = evaluate_from_loader(eval_model, dm.val_dataloader(), device=device, forecast_horizon=fh)
+    in_mae  = in_metrics["mae"]
+
+    # Out-region: full metrics on NY test set (with timestamps + per-home)
+    print("  Computing out-region NY zero-shot metrics…")
+    cache_dir = ROOT / "data" / "processed"
+    ny_local  = ensure_local_parquet(dm.ny_path, cache_dir)
+    ny_metrics, ny_per_home = evaluate_parquet(eval_model, ny_local, cfg, device=device)
+    out_mae = ny_metrics["mae"]
     gap     = out_mae - in_mae
 
-    print(f"  In-region  MAE  (TX+CA val)   : {in_mae:.4f} kWh")
+    print(f"\n  In-region  MAE  (TX+CA val)   : {in_mae:.4f} kWh")
     print(f"  Out-region MAE  (NY zero-shot) : {out_mae:.4f} kWh")
     print(f"  Generalization gap             : {gap:+.4f} kWh")
+    print(f"  NY RMSE                        : {ny_metrics['rmse']:.4f} kWh")
+    print(f"  NY R²                          : {ny_metrics['r2']:.4f}")
+    print(f"  NY Skill score                 : {ny_metrics['skill_score']:.2f}%")
+    print(f"  NY Peak MAE (8am–4pm)          : {ny_metrics['peak_mae']:.4f} kWh")
     print(f"\n  Best checkpoint : {checkpoint_cb.best_model_path}")
     if s3_bucket:
         print(f"  S3 checkpoints  : s3://{s3_bucket}/{s3_run_prefix}/")
     print(f"  CSV logs        : {logger.log_dir}")
     print(f"{'='*60}\n")
+
+    # -- Save results ---------------------------------------------------------
+    import math as _math
+    from datetime import datetime as _dt
+    ckpt_s3 = (
+        f"s3://{s3_bucket}/{s3_run_prefix}/{Path(best_ckpt).name}"
+        if s3_bucket and best_ckpt != "best" else best_ckpt
+    )
+    cfg_mv = cfg.get("model_version", "v1")
+    save_row({
+        "model_version":      cfg_mv,
+        "experiment":         "zero_shot",
+        "ny_days":            0,
+        **{k: ("" if _math.isnan(v) else v) for k, v in ny_metrics.items()},
+        "generalization_gap": gap,
+        "epoch_stopped":      trainer.current_epoch + 1,
+        "timestamp":          _dt.now().strftime("%Y-%m-%dT%H:%M:%S"),
+        "checkpoint_s3_path": ckpt_s3,
+    })
+    now_str = _dt.now().strftime("%Y-%m-%dT%H:%M:%S")
+    save_per_home([
+        {"model_version": cfg_mv, "experiment": "zero_shot",
+         "ny_days": 0, "timestamp": now_str, **h}
+        for h in ny_per_home
+    ])
+    auto_commit(
+        mae=out_mae,
+        r2=ny_metrics["r2"] if not _math.isnan(ny_metrics["r2"]) else 0.0,
+        skill=ny_metrics["skill_score"],
+        model_version=cfg_mv,
+        experiment="zero_shot",
+    )
 
 
 if __name__ == "__main__":

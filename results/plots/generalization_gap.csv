@@ -1,0 +1,2 @@
+model_version,experiment,in_region_mae,out_region_mae,gap
+v1,zero_shot,0.026458294683328276,0.1657261262930322,0.13926783160970393

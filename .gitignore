@@ -37,6 +37,13 @@ models/*.ckpt
 models/checkpoints/
 logs/
 
+# Results files — explicitly tracked (NOT ignored)
+# results/all_results.csv
+# results/all_results.md
+# results/per_home_metrics.csv
+# results/plots/*.png
+# results/plots/*.csv
+
 # OS
 .DS_Store
 Thumbs.db
