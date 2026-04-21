@@ -344,6 +344,53 @@ def process_region(
     return df
 
 
+# -- Synthetic CA augmentation -------------------------------------------------
+
+def _augment_ca_synthetic(real_ca_df: pl.DataFrame) -> pl.DataFrame:
+    """Concatenate synthetic CA homes with real CA homes and overwrite outputs."""
+    from src.dataloader import read_parquet
+
+    syn_local   = PROCESSED / "train_ca_synthetic.parquet"
+    syn_s3_key  = f"{S3_PROCESSED_PREFIX}/train_ca_synthetic.parquet"
+
+    print(f"\n{'-'*60}")
+    print("  Augmenting CA with synthetic homes")
+    print(f"{'-'*60}")
+
+    if syn_local.exists():
+        print(f"  Loading synthetic CA : {syn_local.relative_to(ROOT)}")
+        syn_df = pl.read_parquet(syn_local)
+    elif S3_BUCKET and _s3_exists(S3_BUCKET, syn_s3_key):
+        syn_uri = f"s3://{S3_BUCKET}/{syn_s3_key}"
+        print(f"  Loading synthetic CA : {syn_uri}")
+        syn_df = read_parquet(syn_uri)
+    else:
+        raise FileNotFoundError(
+            f"Synthetic CA parquet not found at {syn_local} or "
+            f"s3://{S3_BUCKET}/{syn_s3_key}. Run src/synthetic.py first."
+        )
+
+    n_real = real_ca_df["dataid"].n_unique()
+    n_syn  = syn_df["dataid"].n_unique()
+    print(f"  Real CA homes      : {n_real}")
+    print(f"  Synthetic CA homes : {n_syn}")
+
+    combined = pl.concat([real_ca_df, syn_df], how="diagonal")
+    print(f"  Combined CA homes  : {combined['dataid'].n_unique()} ({combined.height:,} rows)")
+
+    local_out = PROCESSED / "train_ca.parquet"
+    local_out.parent.mkdir(parents=True, exist_ok=True)
+    combined.write_parquet(local_out)
+    print(f"  Saved local -> {local_out.relative_to(ROOT)}")
+
+    if S3_BUCKET:
+        s3_uri = f"s3://{S3_BUCKET}/{S3_PROCESSED_PREFIX}/train_ca.parquet"
+        write_parquet(combined, s3_uri)
+        print(f"  Uploaded S3 -> {s3_uri}")
+
+    return combined
+
+
 # -- Entry point ---------------------------------------------------------------
 
 def main(force: bool = False) -> None:
@@ -379,6 +426,7 @@ def main(force: bool = False) -> None:
     ]
 
     results: dict[str, int] = {}
+    ca_df: Optional[pl.DataFrame] = None
     for region, solar_f, wx_files, out_f in REGIONS:
         print(f"\n{'-'*60}")
         print(f"  Region: {region.upper()}")
@@ -396,6 +444,13 @@ def main(force: bool = False) -> None:
             force=force,
         )
         results[region] = df["dataid"].n_unique() if df is not None else 0
+        if region == "ca":
+            ca_df = df
+
+    # Augment CA with synthetic homes
+    if ca_df is not None:
+        combined_ca = _augment_ca_synthetic(ca_df)
+        results["ca"] = combined_ca["dataid"].n_unique()
 
     print(f"\n{'='*60}")
     print("  DONE")
