@@ -81,6 +81,24 @@ persistence baseline (predict next hour = current hour).
 
 ---
 
+## Results
+
+### V1 — Baseline (20 homes, TX + CA → NY zero-shot)
+
+| Metric | Value |
+|--------|-------|
+| In-region MAE (TX+CA val) | 0.0295 kWh |
+| Out-of-region MAE (NY zero-shot) | 0.1657 kWh |
+| Generalization gap | +0.1363 kWh (5.6× worse on NY) |
+
+Early stopping at epoch 15, best checkpoint at epoch 5. Training took ~13 minutes on an A100-SXM4-40GB with fp16 mixed precision.
+
+The 5.6× gap reflects the difficulty of zero-shot transfer from sunny TX/CA climates to New York's cloudier, more variable conditions. V2 targets this gap with PVDAQ data (50+ systems, 5–10 years) and ERA5 weather.
+
+→ Full metrics, training curve, and limitations: [`results/v1/results.md`](results/v1/results.md)
+
+---
+
 ## Getting Started
 
 ### Prerequisites
