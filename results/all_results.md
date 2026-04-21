@@ -1,6 +1,6 @@
 # Solar Forecasting — All Experiment Results
 
-*Generated: 2026-04-21 17:51:47*
+*Generated: 2026-04-21 17:58:43*
 
 ## Metric Definitions
 
@@ -17,6 +17,7 @@
 | model_version | experiment | ny_days | mae | rmse | r2 | skill_score | peak_mae |
 |---|---|---|---|---|---|---|---|
 | v1 | in_region_ca | 0 | 0.0173 | 0.0333 | 0.946 | 8.618 | 0.0344 |
+| v2 | in_region_tx | 0 | 0.0352 | 0.0765 | 0.935 | 56.213 | 0.0787 |
 | v1 | in_region_tx | 0 | 0.0356 | 0.0739 | 0.939 | 55.669 | 0.0779 |
 | v1 | finetune_180d | 180 | 0.0550 | 0.1524 | 0.721 | 50.826 |  |
 | v2 | finetune_180d | 180 | 0.0582 | 0.1463 | 0.743 | 48.040 |  |
@@ -120,6 +121,18 @@
 - checkpoint_s3_path: s3://cs7180-final-project/checkpoints/2026-04-21_01-40-26/solar-epoch=04-val_loss=0.0042.ckpt
 
 ## v2
+
+### in_region_tx (ny_days=0)
+
+- mae: 0.0352
+- rmse: 0.0765
+- mape: 90.5787
+- r2: 0.9350
+- skill_score: 56.2128
+- peak_mae: 0.0787
+- generalization_gap: 
+- timestamp: 2026-04-21T17:58:43
+- checkpoint_s3_path: s3://cs7180-final-project/checkpoints/2026-04-21_09-21-34/solar-epoch=02-val_loss=0.0035.ckpt
 
 ### finetune_180d (ny_days=180)
 
