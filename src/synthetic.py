@@ -238,19 +238,38 @@ def sample_panel_params(
         "Single-Family Home 001 (Master)":  size_sfh,
     }
 
+    def _maybe_float(val) -> float | None:
+        """Convert a string/None field from the metadata CSV to float or None."""
+        try:
+            return float(val) if val not in (None, "", "None") else None
+        except (TypeError, ValueError):
+            return None
+
     params = []
     for i, row in enumerate(host_homes.iter_rows(named=True)):
         bt   = row["building_type"]
         pool = size_pools.get(bt, size_town)
+        az   = round(float(rng.choice(az_pool)), 1)
+        kw   = round(float(rng.choice(pool)), 3)
         params.append({
-            "dataid":         f"syn_sd_{i+1:03d}",
-            "building_type":  bt,
-            "lat":            round(civita_lat + rng.uniform(-offset, offset), 6),
-            "lon":            round(civita_lon + rng.uniform(-offset, offset), 6),
-            "system_size_kw": round(float(rng.choice(pool)), 3),
-            "tilt_deg":       round(float(rng.choice(tilt_pool)), 1),
-            "azimuth_deg":    round(float(rng.choice(az_pool)), 1),
-            "module_type":    "Mono-c-Si" if rng.random() < mono_frac else "Multi-c-Si",
+            "dataid":                  f"syn_sd_{i+1:03d}",
+            # Host home metadata
+            "building_type":           bt,
+            "city":                    row.get("city") or "San Diego",
+            "state":                   row.get("state") or "California",
+            "total_square_footage":    _maybe_float(row.get("total_square_footage")),
+            "house_construction_year": _maybe_float(row.get("house_construction_year")),
+            # PVLib-derived panel parameters
+            "lat":                     round(civita_lat + rng.uniform(-offset, offset), 6),
+            "lon":                     round(civita_lon + rng.uniform(-offset, offset), 6),
+            "elevation_m":             sc["civita_elev"],
+            "system_size_kw":          kw,
+            "tilt_deg":                round(float(rng.choice(tilt_pool)), 1),
+            "azimuth_deg":             az,
+            "module_type":             "Mono-c-Si" if rng.random() < mono_frac else "Multi-c-Si",
+            # Pecan Street metadata column names (for reference / parameter log)
+            "total_amount_of_pv":      kw,
+            "pv_panel_direction":      az,
         })
     return params
 
@@ -487,43 +506,89 @@ def add_noise(
 # 7. Output formatting
 # ---------------------------------------------------------------------------
 
-def build_home_df(
-    dataid: str,
+def build_processed_home_df(
+    params: dict,
     kwh: pd.Series,
-    schema_cols: list[str],
+    weather_15: pd.DataFrame,
 ) -> pl.DataFrame:
     """
-    Build a Polars DataFrame that exactly matches the Pecan Street CA solar
-    schema, with all non-solar columns set to None.
+    Build a Polars DataFrame in the processed parquet schema for one synthetic
+    home, matching the output of preprocess.process_region().
 
-    Timestamp convention: Pecan Street stores all CA data with a fixed -05
-    UTC offset (Central Standard Time), regardless of DST. We replicate this
-    by converting UTC → Etc/GMT+5 (POSIX notation for UTC-5) and appending
-    the literal string '-05'. This makes the synthetic timestamps byte-for-byte
-    compatible with the real data, simplifying concatenation in dataloader.py.
+    Columns produced:
+        dataid, local_15min, solar_kwh,
+        GHI_W_m2, DNI_W_m2, DHI_W_m2, Temp_C, WindSpeed_m_s, RelHumidity_pct,
+        lat, lon, tilt_deg, azimuth_deg, capacity_kw, elevation_m,
+        building_type, city, state, total_square_footage, house_construction_year
+
+    Timestamp convention: UTC → Etc/GMT+5 (POSIX UTC-5, no DST), formatted as
+    'YYYY-MM-DD HH:MM:SS-05' to match the real CA processed parquet.
 
     Args:
-        dataid:      Synthetic home identifier (e.g. 'syn_sd_001').
-        kwh:         UTC-indexed Series of kWh per 15-min.
-        schema_cols: Ordered column list from the real Pecan Street CSV.
+        params:     Per-home dict from sample_panel_params (lat, lon,
+                    system_size_kw, tilt_deg, azimuth_deg, elevation_m,
+                    building_type, city, state, total_square_footage,
+                    house_construction_year).
+        kwh:        UTC-indexed pandas Series of kWh per 15-min interval.
+        weather_15: UTC-indexed pandas DataFrame from load_weather() with
+                    columns ghi, dni, dhi, temp_air, wind_speed, RelHumidity_pct.
 
     Returns:
-        Polars DataFrame with the same column set as the real CA solar CSV.
+        Polars DataFrame in the processed schema.
     """
-    # Convert UTC → UTC-5 (Etc/GMT+5 in POSIX = UTC-5) then format
-    ts_utcm5 = kwh.index.tz_convert("Etc/GMT+5")
+    ts_utcm5   = kwh.index.tz_convert("Etc/GMT+5")
     timestamps = [t.strftime("%Y-%m-%d %H:%M:%S-05") for t in ts_utcm5]
 
-    rows: dict = {
-        "dataid":      [dataid] * len(kwh),
-        "localminute": timestamps,
-        "solar":       [round(float(v), 6) for v in kwh.values],
-    }
-    for col in schema_cols:
-        if col not in rows:
-            rows[col] = [None] * len(kwh)
+    # Align weather to the kwh index (same UTC index; reindex for safety)
+    wx = weather_15.reindex(kwh.index)
+    n  = len(kwh)
 
-    return pl.DataFrame({c: rows[c] for c in schema_cols})
+    return (
+        pl.DataFrame({
+            "dataid":                  [params["dataid"]] * n,
+            "local_15min":             timestamps,
+            "solar_kwh":               kwh.values.tolist(),
+            "GHI_W_m2":               wx["ghi"].values.tolist(),
+            "DNI_W_m2":               wx["dni"].values.tolist(),
+            "DHI_W_m2":               wx["dhi"].values.tolist(),
+            "Temp_C":                  wx["temp_air"].values.tolist(),
+            "WindSpeed_m_s":           wx["wind_speed"].values.tolist(),
+            "RelHumidity_pct":         wx["RelHumidity_pct"].values.tolist(),
+            "lat":                     [params["lat"]] * n,
+            "lon":                     [params["lon"]] * n,
+            "tilt_deg":                [params["tilt_deg"]] * n,
+            "azimuth_deg":             [params["azimuth_deg"]] * n,
+            "capacity_kw":             [params["system_size_kw"]] * n,
+            "elevation_m":             [params["elevation_m"]] * n,
+            # Host home metadata
+            "building_type":           [params.get("building_type")] * n,
+            "city":                    [params.get("city")] * n,
+            "state":                   [params.get("state")] * n,
+            "total_square_footage":    [params.get("total_square_footage")] * n,
+            "house_construction_year": [params.get("house_construction_year")] * n,
+        })
+        .with_columns([
+            pl.col("solar_kwh").cast(pl.Float64),
+            pl.col("GHI_W_m2").cast(pl.Float32),
+            pl.col("DNI_W_m2").cast(pl.Float32),
+            pl.col("DHI_W_m2").cast(pl.Float32),
+            pl.col("Temp_C").cast(pl.Float32),
+            pl.col("WindSpeed_m_s").cast(pl.Float32),
+            pl.col("RelHumidity_pct").cast(pl.Float32),
+            pl.col("lat").cast(pl.Float32),
+            pl.col("lon").cast(pl.Float32),
+            pl.col("tilt_deg").cast(pl.Float32),
+            pl.col("azimuth_deg").cast(pl.Float32),
+            pl.col("capacity_kw").cast(pl.Float32),
+            pl.col("elevation_m").cast(pl.Float32),
+            # Nullable host home fields — explicit types so per-home DFs concat cleanly
+            pl.col("building_type").cast(pl.Utf8),
+            pl.col("city").cast(pl.Utf8),
+            pl.col("state").cast(pl.Utf8),
+            pl.col("total_square_footage").cast(pl.Float32),
+            pl.col("house_construction_year").cast(pl.Float32),
+        ])
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -680,14 +745,11 @@ def run_sanity_checks(
         True if all checks pass; False if any fail.
     """
     sc = cfg["synthetic"]
-    schema_cols = pl.read_csv(
-        resolve(cfg, "schema_source_csv"), n_rows=1, infer_schema_length=0,
-    ).columns
 
     results: list[tuple[str, bool, str]] = []
 
     # ---- Check 1: no negative solar values --------------------------------
-    neg_count = int(combined["solar"].cast(pl.Float64, strict=False).fill_null(0).lt(0).sum())
+    neg_count = int(combined["solar_kwh"].cast(pl.Float64, strict=False).fill_null(0).lt(0).sum())
     results.append((
         "No negative solar values",
         neg_count == 0,
@@ -744,8 +806,8 @@ def run_sanity_checks(
 
     # ---- Check 4: date range matches home 9836 ----------------------------
     first_home = combined.filter(pl.col("dataid") == params_list[0]["dataid"])
-    ts_min = first_home["localminute"].min()
-    ts_max = first_home["localminute"].max()
+    ts_min = first_home["local_15min"].min()
+    ts_max = first_home["local_15min"].max()
     expected_start = sc["date_start"]
     expected_end   = sc["date_end"]
     # Compare date portion only (timestamp format: 'YYYY-MM-DD HH:MM:SS-05')
@@ -761,15 +823,16 @@ def run_sanity_checks(
         f"got {ts_min[:10]} → {ts_max[:10]}" if ts_min else "no data",
     ))
 
-    # ---- Check 5: schema match --------------------------------------------
-    real_cols  = set(schema_cols)
-    synth_cols = set(combined.columns)
-    schema_ok  = real_cols == synth_cols
-    detail = "exact match"
-    if not schema_ok:
-        detail = (f"missing={real_cols - synth_cols}  "
-                  f"extra={synth_cols - real_cols}")
-    results.append(("Schema matches Pecan Street CA CSV", schema_ok, detail))
+    # ---- Check 5: required processed columns present ----------------------
+    required = {
+        "dataid", "local_15min", "solar_kwh",
+        "GHI_W_m2", "DNI_W_m2", "DHI_W_m2", "Temp_C", "WindSpeed_m_s", "RelHumidity_pct",
+        "lat", "lon", "tilt_deg", "azimuth_deg", "capacity_kw", "elevation_m",
+    }
+    missing   = required - set(combined.columns)
+    schema_ok = len(missing) == 0
+    detail    = "all required processed columns present" if schema_ok else f"missing={missing}"
+    results.append(("Required processed columns present", schema_ok, detail))
 
     # ---- Print results ----------------------------------------------------
     pr("\n=== Sanity Checks ===")
@@ -884,11 +947,6 @@ def main() -> None:
     pr(f"   Noise std by hour: mean={noise_by_hour.mean():.4f}  "
        f"max={noise_by_hour.max():.4f} kWh/15-min")
 
-    # ---- Schema ------------------------------------------------------------
-    schema_cols = pl.read_csv(
-        resolve(cfg, "schema_source_csv"), n_rows=1, infer_schema_length=0,
-    ).columns
-
     # ---- Simulate ----------------------------------------------------------
     pr(f"\n5. Simulating {len(params_list)} homes with pvlib PVWatts...")
     pr(f"   {'dataid':<14} {'building_type':<35} {'kW':>6} {'tilt':>5} "
@@ -916,7 +974,7 @@ def main() -> None:
            f"{p['system_size_kw']:>6.2f} {p['tilt_deg']:>5.1f} "
            f"{p['azimuth_deg']:>5.1f}  {mean_daily:.3f}")
 
-        all_dfs.append(build_home_df(p["dataid"], kwh, schema_cols))
+        all_dfs.append(build_processed_home_df(p, kwh, weather_15))
 
     # ---- Combine and save --------------------------------------------------
     combined = pl.concat(all_dfs)
