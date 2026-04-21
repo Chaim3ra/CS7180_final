@@ -52,7 +52,7 @@ data:
   seq_len: 96           # context window = 24 h
   forecast_horizon: 4   # prediction horizon = 1 h
 
-  batch_size: 32
+  batch_size: 256
   # Set to 0 on CPU-only machines; 7+ recommended for multi-core GPU machines
   num_workers: 7
 
@@ -95,7 +95,7 @@ trainer:
   precision: "32-true"
   pin_memory: false          # overridden to true at runtime when CUDA detected
   early_stopping_patience: 10
-  log_every_n_steps: 10
+  log_every_n_steps: 100
   val_check_interval: 1.0
   gradient_clip_val: 1.0
   enable_progress_bar: true

@@ -28,6 +28,7 @@ __all__ = [
     "read_parquet",
     "read_csv",
     "write_parquet",
+    "ensure_local_parquet",
 ]
 
 
@@ -128,6 +129,52 @@ def write_parquet(df: pl.DataFrame, path: Union[str, Path]) -> None:
     else:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         df.write_parquet(path)
+
+
+def ensure_local_parquet(path: Union[str, Path], cache_dir: Union[str, Path]) -> str:
+    """Return a local path to a parquet file, downloading from S3 if not cached.
+
+    Checks ``cache_dir`` for a local copy first.  If the file is absent and
+    ``path`` is an S3 URI, it is downloaded once to ``cache_dir`` via boto3.
+    Subsequent calls reuse the local file without touching S3.
+
+    Args:
+        path: Local filesystem path or ``s3://bucket/key`` URI.
+        cache_dir: Directory to store locally cached parquet files.
+
+    Returns:
+        Absolute local path string to the cached file.
+    """
+    path      = str(path)
+    cache_dir = Path(cache_dir)
+
+    if not path.startswith("s3://"):
+        local = Path(path)
+        if local.exists():
+            print(f"  Using local cache: {local.name}")
+            return str(local)
+        raise FileNotFoundError(f"Parquet not found: {local}")
+
+    without_scheme = path[5:]
+    bucket, _, key = without_scheme.partition("/")
+    filename       = key.split("/")[-1]
+    local          = cache_dir / filename
+
+    if local.exists():
+        print(f"  Using local cache: {local.name}")
+        return str(local)
+
+    try:
+        import boto3
+    except ImportError as exc:
+        raise ImportError("boto3 is required for S3 downloads. pip install boto3") from exc
+
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  Downloading from S3 to local cache: {filename} ...", flush=True)
+    boto3.client("s3").download_file(bucket, key, str(local))
+    size_mb = local.stat().st_size / 1024 ** 2
+    print(f"  Downloaded: {local.name} ({size_mb:.1f} MB)")
+    return str(local)
 
 
 def filter_solar_homes(

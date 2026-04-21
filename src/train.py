@@ -28,6 +28,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -59,11 +60,36 @@ except ImportError:
     from pytorch_lightning.loggers import CSVLogger                          # type: ignore[no-redef]
 
 from src.models import build
-from src.dataloader import SolarWindowDataset, read_parquet
+from src.dataloader import SolarWindowDataset, read_parquet, ensure_local_parquet
 
 WEATHER_COLS  = ["GHI_W_m2", "DNI_W_m2", "DHI_W_m2", "Temp_C", "WindSpeed_m_s", "RelHumidity_pct"]
 SOLAR_COL     = "solar_kwh"
 METADATA_COLS = ["lat", "lon", "tilt_deg", "azimuth_deg", "capacity_kw", "elevation_m"]
+
+
+class EpochSummaryCallback(L.Callback):
+    """Prints one clean summary line per epoch; use with enable_progress_bar=False."""
+
+    def __init__(self, max_epochs: int) -> None:
+        self._max_epochs = max_epochs
+        self._t0: float  = 0.0
+
+    def on_train_epoch_start(self, trainer, pl_module) -> None:
+        self._t0 = time.time()
+
+    def on_validation_epoch_end(self, trainer, pl_module) -> None:
+        if trainer.sanity_checking or not trainer.is_global_zero:
+            return
+        m     = trainer.callback_metrics
+        epoch = trainer.current_epoch + 1
+        print(
+            f"Epoch {epoch:>3}/{self._max_epochs}"
+            f" | train_loss: {float(m.get('train_loss', float('nan'))):.4f}"
+            f" | val_loss: {float(m.get('val_loss', float('nan'))):.4f}"
+            f" | MAE: {float(m.get('val_mae', float('nan'))):.4f}"
+            f" | {int(time.time() - self._t0)}s",
+            flush=True,
+        )
 
 
 class VerboseEarlyStopping(EarlyStopping):
@@ -188,7 +214,13 @@ class MultiHomeDataModule(L.LightningDataModule):
     - Test:      NY parquet — all rows per home (zero-shot).
     """
 
-    def __init__(self, cfg: dict, fast: bool = False, pin_memory: bool = False):
+    def __init__(
+        self,
+        cfg: dict,
+        fast: bool = False,
+        pin_memory: bool = False,
+        cache_dir: Optional[Path] = None,
+    ):
         super().__init__()
         d = cfg["data"]
         self.tx_path          = _resolve_parquet(d["train_tx_parquet"], cfg)
@@ -200,6 +232,7 @@ class MultiHomeDataModule(L.LightningDataModule):
         self.batch_size       = d["batch_size"]
         self.num_workers      = d["num_workers"]
         self.pin_memory       = pin_memory
+        self.cache_dir        = cache_dir or ROOT / "data" / "processed"
         self.fast_train_cap = 2_000 if fast else None
         self.fast_val_cap   =   500 if fast else None
         self.fast_test_cap  =   500 if fast else None
@@ -209,9 +242,13 @@ class MultiHomeDataModule(L.LightningDataModule):
         self._test_ds  = None
 
     def setup(self, stage: Optional[str] = None) -> None:
-        tx = read_parquet(self.tx_path)
-        ca = read_parquet(self.ca_path)
-        ny = read_parquet(self.ny_path)
+        # Ensure parquets are local before loading — downloads from S3 once if absent.
+        tx_local = ensure_local_parquet(self.tx_path, self.cache_dir)
+        ca_local = ensure_local_parquet(self.ca_path, self.cache_dir)
+        ny_local = ensure_local_parquet(self.ny_path, self.cache_dir)
+        tx = read_parquet(tx_local)
+        ca = read_parquet(ca_local)
+        ny = read_parquet(ny_local)
 
         train_sets: list[SolarWindowDataset] = []
         val_sets:   list[SolarWindowDataset] = []
@@ -342,7 +379,7 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
         monitor="val_loss",
         patience=t["early_stopping_patience"],
         mode="min",
-        verbose=True,
+        verbose=False,
     )
     logger = CSVLogger(save_dir=str(ROOT / "logs"), name="solar_forecast")
 
@@ -351,17 +388,19 @@ def main(config_path: str = "configs/experiment.yaml", fast: bool = False) -> No
     if fast:
         print(f"  [FAST MODE] max_epochs=5, train cap=2000, val cap=500, test cap=500")
 
+    epoch_bar = EpochSummaryCallback(max_epochs=max_epochs)
+
     trainer = L.Trainer(
         max_epochs=max_epochs,
         accelerator=t["accelerator"],
         devices=t["devices"],
         precision=precision,
-        log_every_n_steps=t["log_every_n_steps"],
+        log_every_n_steps=100,
         val_check_interval=t["val_check_interval"],
         gradient_clip_val=t["gradient_clip_val"],
-        enable_progress_bar=t["enable_progress_bar"],
+        enable_progress_bar=False,
         enable_model_summary=t["enable_model_summary"],
-        callbacks=[checkpoint_cb, early_stop_cb],
+        callbacks=[checkpoint_cb, early_stop_cb, epoch_bar],
         logger=logger,
         default_root_dir=str(ROOT / "logs"),
     )
