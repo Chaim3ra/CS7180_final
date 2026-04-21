@@ -478,8 +478,8 @@ def main() -> None:
         description="Fine-tune solar forecasting model on NY data.",
     )
     parser.add_argument(
-        "--ny_days", type=int, required=True, choices=[7, 30, 90],
-        help="Days of NY data to use for fine-tuning (7, 30, or 90).",
+        "--ny_days", type=int, required=True,
+        help="Days of NY data to use for fine-tuning (any positive integer).",
     )
     parser.add_argument(
         "--checkpoint", default=DEFAULT_CHECKPOINT,
