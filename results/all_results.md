@@ -1,6 +1,6 @@
 # Solar Forecasting — All Experiment Results
 
-*Generated: 2026-04-21 02:41:31*
+*Generated: 2026-04-21 08:08:14*
 
 ## Metric Definitions
 
@@ -18,7 +18,8 @@
 |---|---|---|---|---|---|---|---|
 | v1 | in_region_ca | 0 | 0.0173 | 0.0333 | 0.946 | 8.618 | 0.0344 |
 | v1 | in_region_tx | 0 | 0.0356 | 0.0739 | 0.939 | 55.669 | 0.0779 |
-| v1 | zero_shot | 0 | 0.1657 | 0.3765 | 0.516 | 28.993 | 0.3338 |
+| v1 | finetune_7d | 7 | 0.1495 | 0.2950 | 0.697 | 34.820 |  |
+| v1 | zero_shot | 0 | 0.1657 | 0.3765 | 0.516 | 28.994 | 0.3338 |
 
 ## v1
 
@@ -46,15 +47,28 @@
 - timestamp: 2026-04-21T02:41:31
 - checkpoint_s3_path: s3://cs7180-final-project/checkpoints/2026-04-21_01-40-26/solar-epoch=04-val_loss=0.0042.ckpt
 
+### finetune_7d (ny_days=7)
+
+- mae: 0.1495
+- rmse: 0.2950
+- mape: 1326.8901
+- r2: 0.6969
+- skill_score: 34.8201
+- peak_mae: 
+- generalization_gap: 
+- epoch_stopped: 13
+- timestamp: 2026-04-21T08:08:14
+- checkpoint_s3_path: s3://cs7180-final-project/checkpoints/finetune_v1_ny7days/ft-v1-ny7d-epoch=06-val_loss=0.0870.ckpt
+
 ### zero_shot (ny_days=0)
 
 - mae: 0.1657
 - rmse: 0.3765
-- mape: 606.1434
+- mape: 606.1435
 - r2: 0.5157
 - skill_score: 28.9935
 - peak_mae: 0.3338
 - generalization_gap: 
-- timestamp: 2026-04-21T02:29:28
+- timestamp: 2026-04-21T08:08:14
 - checkpoint_s3_path: s3://cs7180-final-project/checkpoints/2026-04-21_01-40-26/solar-epoch=04-val_loss=0.0042.ckpt
 
