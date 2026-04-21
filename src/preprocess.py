@@ -346,16 +346,27 @@ def process_region(
 
 # -- Synthetic CA augmentation -------------------------------------------------
 
-def _augment_ca_synthetic(real_ca_df: pl.DataFrame) -> pl.DataFrame:
+def _augment_ca_synthetic(real_ca_df: pl.DataFrame, force: bool = False) -> pl.DataFrame:
     """Concatenate synthetic CA homes with real CA homes and overwrite outputs."""
     from src.dataloader import read_parquet
 
     syn_local   = PROCESSED / "train_ca_synthetic.parquet"
     syn_s3_key  = f"{S3_PROCESSED_PREFIX}/train_ca_synthetic.parquet"
+    local_out   = PROCESSED / "train_ca.parquet"
+    s3_key_out  = f"{S3_PROCESSED_PREFIX}/train_ca.parquet"
 
     print(f"\n{'-'*60}")
     print("  Augmenting CA with synthetic homes")
     print(f"{'-'*60}")
+
+    if not force:
+        if local_out.exists():
+            print(f"  [CACHED local]  train_ca.parquet (combined)")
+            return pl.read_parquet(local_out)
+        if S3_BUCKET and _s3_exists(S3_BUCKET, s3_key_out):
+            s3_uri = f"s3://{S3_BUCKET}/{s3_key_out}"
+            print(f"  [CACHED S3]     {s3_uri}")
+            return read_parquet(s3_uri)
 
     if syn_local.exists():
         print(f"  Loading synthetic CA : {syn_local.relative_to(ROOT)}")
@@ -370,6 +381,11 @@ def _augment_ca_synthetic(real_ca_df: pl.DataFrame) -> pl.DataFrame:
             f"s3://{S3_BUCKET}/{syn_s3_key}. Run src/synthetic.py first."
         )
 
+    # Real CA dataid is Int64; synthetic dataid is String (e.g. "syn_sd_001").
+    # Cast both to Utf8 so pl.concat sees a uniform schema.
+    real_ca_df = real_ca_df.with_columns(pl.col("dataid").cast(pl.Utf8))
+    syn_df     = syn_df.with_columns(pl.col("dataid").cast(pl.Utf8))
+
     n_real = real_ca_df["dataid"].n_unique()
     n_syn  = syn_df["dataid"].n_unique()
     print(f"  Real CA homes      : {n_real}")
@@ -378,7 +394,6 @@ def _augment_ca_synthetic(real_ca_df: pl.DataFrame) -> pl.DataFrame:
     combined = pl.concat([real_ca_df, syn_df], how="diagonal")
     print(f"  Combined CA homes  : {combined['dataid'].n_unique()} ({combined.height:,} rows)")
 
-    local_out = PROCESSED / "train_ca.parquet"
     local_out.parent.mkdir(parents=True, exist_ok=True)
     combined.write_parquet(local_out)
     print(f"  Saved local -> {local_out.relative_to(ROOT)}")
@@ -449,7 +464,7 @@ def main(force: bool = False) -> None:
 
     # Augment CA with synthetic homes
     if ca_df is not None:
-        combined_ca = _augment_ca_synthetic(ca_df)
+        combined_ca = _augment_ca_synthetic(ca_df, force=force)
         results["ca"] = combined_ca["dataid"].n_unique()
 
     print(f"\n{'='*60}")
